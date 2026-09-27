@@ -1,0 +1,6 @@
+math atlas: 2 fonts, 8544 templates (69 ms)
+
+== im2latex/test  n=6810
+   token edit distance / |gt| 0.388   exact match 0.017
+   symbols: precision 0.773  recall 0.704  F1 0.737
+   0.63 ms/formula, 21.8 symbols/formula

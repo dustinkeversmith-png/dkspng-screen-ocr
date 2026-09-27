@@ -1,0 +1,7 @@
+prior: data/math_prior.tsv
+math atlas: 2 fonts, 8544 templates (94 ms)
+
+== im2latex/val  n=6072
+   token edit distance / |gt| 0.352   exact match 0.045
+   symbols: precision 0.820  recall 0.745  F1 0.781
+   0.91 ms/formula, 21.6 symbols/formula

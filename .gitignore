@@ -2,3 +2,5 @@
 /build
 *.tsv
 *.png
+__pycache__/
+!data/math_prior.tsv

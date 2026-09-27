@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
         std::printf("\n== %-13s n=%zu (skipped %zu)\n", job.name.c_str(), score.n, skipped);
         std::printf("   CER %.3f  | CER(case-insens.) %.3f  | EM %.3f  | EM(ci) %.3f\n", score.cer(), score.cer_ci(),
                     score.em(), score.em_ci());
-        std::printf("   %.3f ms/crop, %.1f us/glyph, %.0f distance evals/glyph\n", ms / double(score.n ? score.n : 1),
+        std::printf("   %.3f ms/crop, %.1f us/glyph, %.0f full distance evals/glyph (%.0f bound checks)\n", ms / double(score.n ? score.n : 1),
                     1000.0 * ms / double(glyphs ? glyphs : 1), evals / double(glyphs ? glyphs : 1), double(cls.bound_evals - bounds0) / double(glyphs ? glyphs : 1));
     }
     return 0;

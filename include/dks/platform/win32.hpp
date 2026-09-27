@@ -72,6 +72,30 @@ inline Frame capture_screen() {
     return f;
 }
 
+// Current mouse cursor rectangle in capture_screen() coordinates (virtual-screen origin). GDI BitBlt
+// normally does not include the hardware cursor, but software cursors, pointer trails and remote
+// sessions do; CursorMaskStage uses this rect to inpaint it before segmentation.
+inline bool cursor_rect(Rect& out) {
+    CURSORINFO ci{};
+    ci.cbSize = sizeof(ci);
+    if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING)) return false;
+    int32_t w = 32, h = 32, hx = 0, hy = 0;
+    ICONINFO ii{};
+    if (GetIconInfo(ci.hCursor, &ii)) {
+        hx = int32_t(ii.xHotspot), hy = int32_t(ii.yHotspot);
+        BITMAP bm{};
+        if (ii.hbmMask && GetObject(ii.hbmMask, sizeof(bm), &bm)) {
+            w = bm.bmWidth;
+            h = ii.hbmColor ? bm.bmHeight : bm.bmHeight / 2;  // monochrome cursors stack AND/XOR masks
+        }
+        if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    }
+    out = Rect{ci.ptScreenPos.x - hx - GetSystemMetrics(SM_XVIRTUALSCREEN), ci.ptScreenPos.y - hy - GetSystemMetrics(SM_YVIRTUALSCREEN),
+               w, h};
+    return true;
+}
+
 namespace detail {
 struct ComInit {
     ComInit() { CoInitializeEx(nullptr, COINIT_MULTITHREADED); }

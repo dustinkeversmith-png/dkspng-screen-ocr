@@ -1,0 +1,42 @@
+
+== ui_states  (1700 crops)
+  1300 exemplars, 0.17 ms per crop (both packs)
+  TemplatePack k-NN (trained)        accuracy 0.915  (366 / 400)
+      checked                   200  recall 0.89   confused with unchecked:22
+      unchecked                 200  recall 0.94
+  CheckStatePack rule (no training)  accuracy 0.805  (322 / 400)
+      checked                   200  recall 0.94
+      unchecked                 200  recall 0.68   confused with checked:65
+
+== rico_widgets  (501 crops, screen-disjoint split)
+  229 exemplars, 23 classes
+  TemplatePack k-NN, fine classes    accuracy 0.585  (159 / 272)
+      icon.add                    3  recall 0.67   confused with icon.favorite:1
+      icon.arrow_backward        23  recall 0.91
+      icon.check                  4  recall 0.00   confused with icon.star:4
+      icon.close                  7  recall 0.14   confused with icon.arrow_backward:1 icon.arrow_forward:1 icon.check:1 icon.home:1 icon.refresh:1 icon.settings:1
+      icon.favorite               2  recall 0.00   confused with icon.home:1 icon.search:1
+      icon.home                   1  recall 0.00   confused with icon.add:1
+      icon.info                   1  recall 0.00   confused with icon.star:1
+      icon.menu                  22  recall 0.68
+      icon.more                  13  recall 0.08   confused with icon.add:4 ui.switch:4
+      icon.notifications          1  recall 0.00   confused with icon.search:1
+      icon.pause                  2  recall 0.00   confused with icon.star:2
+      icon.play                   3  recall 0.00   confused with icon.close:2 icon.settings:1
+      icon.refresh               13  recall 0.77
+      icon.search                15  recall 0.60   confused with icon.share:5
+      icon.settings               4  recall 0.00   confused with icon.home:1 icon.menu:3
+      icon.share                 12  recall 0.92
+      icon.star                   2  recall 0.00   confused with icon.favorite:1 icon.menu:1
+      ui.checkbox                16  recall 0.44   confused with icon.more:4 ui.slider:2 ui.switch:2
+      ui.searchbar                6  recall 0.00   confused with ui.checkbox:2 ui.switch:4
+      ui.slider                   3  recall 0.00   confused with icon.more:1 ui.switch:2
+      ui.stepper                 44  recall 0.93
+      ui.switch                  75  recall 0.55   confused with ui.stepper:10
+  same, icons pooled into 'icon'     accuracy 0.772  (210 / 272)
+      icon                      128  recall 0.95
+      ui.checkbox                16  recall 0.44   confused with icon:5 ui.slider:2 ui.switch:2
+      ui.searchbar                6  recall 0.00   confused with ui.checkbox:2 ui.switch:4
+      ui.slider                   3  recall 0.00   confused with icon:1 ui.switch:2
+      ui.stepper                 44  recall 0.93
+      ui.switch                  75  recall 0.55   confused with icon:18 ui.stepper:10

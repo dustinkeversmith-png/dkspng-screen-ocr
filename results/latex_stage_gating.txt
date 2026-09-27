@@ -1,0 +1,4 @@
+LaTeX stage gating (layout + text + latex):
+  im2latex     1000 images   with >=1 LaTeX claim:  23.0%   claims/image 0.24
+  zenodo         36 images   with >=1 LaTeX claim:   8.3%   claims/image 0.08
+  negatives      28 images   with >=1 LaTeX claim:   3.6%   claims/image 0.04

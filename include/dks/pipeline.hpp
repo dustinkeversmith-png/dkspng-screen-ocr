@@ -78,15 +78,20 @@ public:
     ScreenRead read(const ColorView& frame) const {
         ScreenRead out;
         out.layout = analyze_layout(frame, lp_);
-        const Gray8 gray = to_luma(frame);
-        out.elements.resize(out.layout.elements.size());
+        out.elements = read_boxes(out.layout, to_luma(frame));
+        return out;
+    }
+
+    // OCR pass over an existing layout (used by the pipeline's TextReadStage).
+    std::vector<ReadElement> read_boxes(const Layout& layout, const Gray8& gray) const {
+        std::vector<ReadElement> elements(layout.elements.size());
         auto work = [&](size_t t) {
             const ocr::Recognizer rec(cls_[t], rp_);
             // Static striping: box i always lands on thread i % T, so each thread's memo sees the
             // same boxes frame after frame (dynamic scheduling scatters them and misses the cache).
-            for (size_t i = t; i < out.elements.size(); i += cls_.size()) {
-                ReadElement& re = out.elements[i];
-                const Element& e = out.layout.elements[i];
+            for (size_t i = t; i < elements.size(); i += cls_.size()) {
+                ReadElement& re = elements[i];
+                const Element& e = layout.elements[i];
                 re.element = e;
                 if (e.bbox.h > vp_.max_height) continue;
                 const Rect r = e.bbox.inflate(2).clip(gray.width(), gray.height());
@@ -103,7 +108,7 @@ public:
             for (size_t t = 0; t < cls_.size(); ++t) pool.emplace_back(work, t);
             for (auto& th : pool) th.join();
         }
-        return out;
+        return elements;
     }
 
     // Aggregate classifier counters over all thread copies.

@@ -346,11 +346,197 @@ def fetch_negatives():
         pairs.append((img, gt))
     write_manifest(out, pairs)
 
+# ----------------------------------------------------------------------------- im2latex-100k
+IM2LATEX = "https://huggingface.co/api/datasets/yuntian-deng/im2latex-100k/parquet/default/{split}/0.parquet"
 
-FETCHERS = {"zenodo": fetch_zenodo, "webui": fetch_webui, "icdar_bd": fetch_icdar_bd, "negatives": fetch_negatives}
+
+def fetch_im2latex(splits=("test", "val"), cap_mb: int = 100):
+    """im2latex-100k (Deng et al. 2017), clean born-digital Computer-Modern renders + normalised LaTeX.
+    test (~34 MB) + val (~30 MB) parquet shards, hard-capped at `cap_mb`."""
+    import pyarrow.parquet as pq
+
+    out = ROOT / "im2latex"
+    budget = Budget("im2latex", cap_mb * 1024 * 1024)
+    pairs = []
+    for split in splits:
+        data = http_get(IM2LATEX.format(split=split), budget)
+        if data is None:
+            print(f"  {split}: would exceed the cap, skipped")
+            continue
+        d = out / split
+        d.mkdir(parents=True, exist_ok=True)
+        table = pq.read_table(io.BytesIO(data), columns=["formula", "filename", "image"])
+        for i, rec in enumerate(table.to_pylist()):
+            b = rec["image"]["bytes"] if isinstance(rec["image"], dict) else rec["image"]
+            stem = Path(rec["filename"]).stem if rec.get("filename") else f"{i:06d}"
+            img = d / f"{stem}{sniff_ext(b)}"
+            img.write_bytes(b)
+            W, H = image_size(b)
+            gt = d / f"{stem}.gt.tsv"
+            write_gt(gt, [(0, 0, W, H, "Formula", rec["formula"])])
+            pairs.append((img, gt))
+        print(f"  {split}: {table.num_rows} formulas  {budget}")
+    write_manifest(out, pairs)
+
+
+# ----------------------------------------------------------------------------- UI widget states
+CHECKBOX = "https://huggingface.co/api/datasets/meghnagera15/checkbox-cropped-binary/parquet/default/{split}/0.parquet"
+
+
+def fetch_ui_states(cap_mb: int = 100):
+    """Cropped UI checkboxes / radio buttons labelled checked vs unchecked (meghnagera15/checkbox-cropped-binary)."""
+    import pyarrow.parquet as pq
+
+    out = ROOT / "ui_states"
+    budget = Budget("ui_states", cap_mb * 1024 * 1024)
+    pairs = []
+    for split in ("train", "validation", "test"):
+        data = http_get(CHECKBOX.format(split=split), budget)
+        if data is None:
+            print(f"  {split}: would exceed the cap, skipped")
+            continue
+        table = pq.read_table(io.BytesIO(data))
+        names = ["checked", "unchecked"]
+        d = out / split
+        d.mkdir(parents=True, exist_ok=True)
+        for i, rec in enumerate(table.to_pylist()):
+            b = rec["image"]["bytes"] if isinstance(rec["image"], dict) else rec["image"]
+            label = names[rec["label"]] if isinstance(rec["label"], int) else str(rec["label"])
+            img = d / f"{i:05d}{sniff_ext(b)}"
+            img.write_bytes(b)
+            W, H = image_size(b)
+            gt = d / f"{i:05d}.gt.tsv"
+            write_gt(gt, [(0, 0, W, H, f"ui.state.{label}", "")])
+            pairs.append((img, gt))
+        print(f"  {split}: {table.num_rows} crops  {budget}")
+    write_manifest(out, pairs)
+
+
+# ----------------------------------------------------------------------------- Rico widget crops
+RICO_SEM = ("https://huggingface.co/datasets/creative-graphic-design/Rico/resolve/main/"
+            "ui-screenshots-and-hierarchies-with-semantic-annotations/{split}-00000-of-00001.parquet")
+RICO_ROWS = "https://datasets-server.huggingface.co/rows"
+RICO_LABELS = ["Text", "Image", "Icon", "Text Button", "List Item", "Input", "Background Image", "Card", "Web View",
+               "Radio Button", "Drawer", "Checkbox", "Advertisement", "Modal", "Pager Indicator", "Slider",
+               "On/Off Switch", "Button Bar", "Toolbar", "Number Stepper", "Multi-Tab", "Date Picker", "Map View",
+               "Video", "Bottom Navigation"]
+RICO_WIDGETS = {"Checkbox": "ui.checkbox", "Radio Button": "ui.radio", "On/Off Switch": "ui.switch",
+                "Slider": "ui.slider", "Pager Indicator": "ui.pager", "Number Stepper": "ui.stepper"}
+RICO_ICONS = {"star", "search", "check", "close", "menu", "add", "arrow_backward", "arrow_forward", "settings",
+              "favorite", "share", "delete", "edit", "refresh", "home", "info", "more", "play", "pause", "notifications"}
+
+
+def fetch_rico_widgets(cap_mb: int = 100, per_class: int = 120, scale: float = 1 / 3, splits=("test", "validation")):
+    """Rico (Deka et al. 2017) semantic annotations (Liu et al. 2018): component + icon-class labels are read
+    from the 13 MB test annotation shard; only screenshots that contain wanted widgets are fetched (row API),
+    and the widget crops are saved downscaled by `scale` (1440x2560 phone -> ~480 px wide)."""
+    import pyarrow.parquet as pq
+    from PIL import Image
+
+    out = ROOT / "rico_widgets"
+    out.mkdir(parents=True, exist_ok=True)
+    budget = Budget("rico_widgets", cap_mb * 1024 * 1024)
+    # Resumable: crops already on disk count against the budget and against the per-class caps.
+    taken, pairs = {}, []
+    for gt in sorted(out.rglob("*.gt.tsv")):
+        img = gt.with_name(gt.name.replace(".gt.tsv", ".png"))
+        if img.exists():
+            lab = gt.read_text(encoding="utf-8").split("\t")[4]
+            taken[lab] = taken.get(lab, 0) + 1
+            pairs.append((img, gt))
+    done_rows = {p[0].name.split("_")[0] for p in pairs}
+    prev = out / ".downloaded_bytes"
+    if prev.exists():
+        budget.take(int(prev.read_text()))
+    for split in splits:
+        _rico_split(split, out, budget, taken, pairs, done_rows, per_class, scale)
+    prev.write_text(str(budget.used))
+    write_manifest(out, pairs)
+    print("  per class:", dict(sorted(taken.items())))
+    print(" ", budget)
+
+
+def _rico_split(split, out, budget, taken, pairs, done_rows, per_class, scale):
+    import pyarrow.parquet as pq
+    from PIL import Image
+
+    sem = http_get(RICO_SEM.format(split=split), budget)
+    if sem is None:
+        print(f"  {split}: annotation shard exceeds the remaining budget")
+        return
+    tag = split[0]  # r = test (original naming), v = validation
+    tag = "r" if split == "test" else tag
+    table = pq.read_table(io.BytesIO(sem), columns=["children"])
+    wanted = {}  # row -> [(label, bounds)]
+    for row, rec in enumerate(table.column("children").to_pylist()):
+        items = []
+        for group in rec or []:
+            n = len(group.get("component_label") or [])
+            rid = group.get("resource_id") or [None] * n
+            kl = group.get("klass") or [None] * n
+            for lab, b, ic, r_id, k in zip(group.get("component_label") or [], group.get("bounds") or [],
+                                           group.get("icon_class") or [None] * n, rid, kl):
+                name = RICO_LABELS[lab] if isinstance(lab, int) and lab < len(RICO_LABELS) else None
+                if name in RICO_WIDGETS:
+                    items.append((RICO_WIDGETS[name], b))
+                elif name == "Icon" and ic in RICO_ICONS:
+                    items.append((f"icon.{ic}", b))
+                elif name == "Input" and "search" in f"{r_id} {k}".lower():
+                    items.append(("ui.searchbar", b))
+        if items:
+            wanted[row] = items
+    # Greedy row order that favours rare classes first, deterministic.
+    counts = {}
+    for items in wanted.values():
+        for lab, _ in items:
+            counts[lab] = counts.get(lab, 0) + 1
+    order = sorted(wanted, key=lambda r: (min(counts[l] for l, _ in wanted[r]), r))
+    for row in order:
+        if f"{tag}{row:05d}" in done_rows:
+            continue
+        items = [(l, b) for l, b in wanted[row] if taken.get(l, 0) < per_class]
+        if not items:
+            continue
+        time.sleep(0.4)
+        try:
+            meta = get_json(f"{RICO_ROWS}?dataset=creative-graphic-design/Rico&config=ui-screenshots-and-view-hierarchies"
+                            f"&split={split}&offset={row}&length=1")
+            src = meta["rows"][0]["row"]["screenshot"]["src"]
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! row {row}: {e}")
+            continue
+        data = http_get(src, budget)
+        if data is None:
+            print("  budget reached")
+            break
+        shot = Image.open(io.BytesIO(data)).convert("RGB")
+        sx, sy = shot.width / 1440.0, shot.height / 2560.0  # annotation bounds are in 1440x2560 space
+        for k, (lab, b) in enumerate(items):
+            x0, y0, x1, y1 = b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy
+            if x1 - x0 < 12 or y1 - y0 < 12 or x0 < 0 or y0 < 0 or x1 > shot.width or y1 > shot.height:
+                continue
+            pad = 6
+            crop = shot.crop((max(0, x0 - pad), max(0, y0 - pad), min(shot.width, x1 + pad), min(shot.height, y1 + pad)))
+            crop = crop.resize((max(8, round(crop.width * scale)), max(8, round(crop.height * scale))), Image.LANCZOS)
+            d = out / lab.replace(".", "_")
+            d.mkdir(parents=True, exist_ok=True)
+            stem = f"{tag}{row:05d}_{k:02d}"
+            img = d / f"{stem}.png"
+            crop.save(img)
+            gt = d / f"{stem}.gt.tsv"
+            write_gt(gt, [(0, 0, crop.width, crop.height, lab, "")])
+            pairs.append((img, gt))
+            taken[lab] = taken.get(lab, 0) + 1
+        if len(pairs) % 50 < len(items):
+            print(f"  {split}: {len(pairs)} crops  {budget}", flush=True)
+
+
+FETCHERS = {"zenodo": fetch_zenodo, "webui": fetch_webui, "icdar_bd": fetch_icdar_bd, "negatives": fetch_negatives,
+            "im2latex": fetch_im2latex, "ui_states": fetch_ui_states, "rico_widgets": fetch_rico_widgets}
 
 if __name__ == "__main__":
-    wanted = sys.argv[1:] or list(FETCHERS)
+    # Default run = the original three screen datasets + negatives; the pack datasets are opt-in by name.
+    wanted = sys.argv[1:] or ["zenodo", "webui", "icdar_bd", "negatives"]
     for name in wanted:
         print(f"== {name}")
         FETCHERS[name]()

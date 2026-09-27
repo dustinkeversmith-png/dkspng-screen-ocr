@@ -23,14 +23,27 @@ include/dks/
                                      cheap copies that share the template index (one per thread)
              recognizer.hpp          two-pass DP word/line recogniser + text-evidence stats
   pipeline.hpp                       ScreenReader: layout + OCR pass over every box + text verification
+  pipeline/  pipeline_stage.hpp      AnalysisContext blackboard, SemanticTag, Region, IPipelineStage, Pipeline
+             core_stages.hpp         CursorMaskStage, LayoutStage, TextReadStage (the baseline as stages)
+  detection/ shape_descriptor.hpp    colour/polarity-agnostic widget descriptor (HOG-lite + ink map)
+             detection_pack.hpp      IShapeClassifier, TemplatePack (.dkpk), PackRegistry, DetectionStage
+             rule_packs.hpp          training-free packs (CheckStatePack)
+  latex/     math_symbols.hpp        math atlas label -> LaTeX
+             math_reader.hpp         symbol segmentation + classification (no shared baseline), prior
+             spatial_tree_parsing.hpp  radicals, accents, fractions, limits, scripts -> LaTeX tokens
+             latex_stage.hpp         LatexStage: formula regions + math evidence gate
   eval/      metrics.hpp             IoU matching, split/merge, containment depth, CER / EM
-  platform/  win32.hpp               (opt-in) GDI screen capture, WIC image decode/encode
+             latex_metrics.hpp       canonical LaTeX token edit distance, symbol-bag P/R/F1
+  platform/  win32.hpp               (opt-in) GDI screen capture, cursor rect, WIC image decode/encode
 tools/       fetch_datasets.py       capped (<=50 MB/dataset) downloader + normaliser (+ local wallpaper negatives)
              build_atlas.py          renders the glyph atlas from system fonts
              make_synth_ocr.py       "rendered font grid" test set (seen + held-out fonts)
              make_report.py          OCR-over-every-box HTML report (report_template.html)
-bench/       bench_segment.cpp  bench_ocr.cpp  screen_ocr.cpp (live)  ocr_debug.cpp
-tests/       test_core.cpp
+             build_math_atlas.py     renders data/math_fonts.dksa from fonts/*.otf (Latin Modern Math, STIX Two Math)
+bench/       bench_segment  bench_ocr  screen_ocr (live)  ocr_debug
+             bench_packs  bench_latex  bench_latex_stage  screen_pipeline (modular pipeline, live or image)
+tests/       test_core.cpp  test_pipeline.cpp
+data/        ui_fonts.dksa  math_fonts.dksa  math_prior.tsv  packs/*.dkpk
 results/     outputs of the runs quoted below
 ```
 
@@ -49,6 +62,13 @@ build/bench_segment --only negatives    # false boxes on 28 stock wallpapers (no
 build/bench_ocr                         # synth, ICDAR Born-Digital, WebUI text
 build/screen_ocr --frames 3 --out overlay.png --tsv boxes.tsv   # live desktop
 python tools/make_report.py --live      # HTML report of every box's reading (report/ocr_report.html)
+
+python tools/fetch_datasets.py im2latex ui_states rico_widgets   # pack / LaTeX datasets (opt-in)
+python tools/build_math_atlas.py        # data/math_fonts.dksa from fonts/
+build/bench_latex --make-prior          # data/math_prior.tsv from the im2latex *val* split
+build/bench_packs                       # trains + scores packs, writes data/packs/*.dkpk
+build/bench_latex                       # im2latex test split
+build/screen_pipeline --latex           # live: cursor mask, layout, text, packs, LaTeX
 ```
 
 ```cpp
@@ -64,12 +84,65 @@ for (auto& e : r.elements)             // every box: geometry, kind, depth, read
     if (e.is_text) use(e.element.bbox, e.text, e.confidence);
 ```
 
+## Modular pipeline (packs and LaTeX as separable stages)
+
+The core (layout, `ScreenReader`) is unchanged and still usable alone. Everything else is a stage that
+reads and writes an `AnalysisContext` blackboard; extra meaning is attached as `SemanticTag`s per element
+(or on derived `Region`s), never by changing the core types.
+
+```
+Layer 0  LayoutStage          edge map, run CCL, layout, hierarchy            (core)
+Layer 1  CursorMaskStage      inpaints the pointer rect before layout          (win32::cursor_rect)
+         DetectionStage       runs every pack in a PackRegistry
+Layer 2  TextReadStage        OCR of every box + verification  -> {"text", reading}   (ui_fonts.dksa)
+Layer 2/3 LatexStage          formula regions, math reader, spatial parser -> Region {"latex", tokens}
+                                                                               (math_fonts.dksa)
+```
+
+```cpp
+#include "dks/pipeline/core_stages.hpp"
+#include "dks/detection/detection_pack.hpp"
+#include "dks/detection/rule_packs.hpp"
+#include "dks/latex/latex_stage.hpp"
+
+dks::Pipeline pipe;
+pipe.add(std::make_shared<dks::CursorMaskStage>([](dks::Rect& r) { return dks::win32::cursor_rect(r); }))
+    .add(std::make_shared<dks::LayoutStage>())
+    .add(std::make_shared<dks::TextReadStage>(screen_reader));
+
+auto packs = std::make_shared<dks::detect::PackRegistry>();
+packs->add(dks::detect::TemplatePack::load("data/packs/rico_widget_type.dkpk"));      // writes "widget"
+dks::detect::PackScope needs_box;                                                      // only on checkboxes
+needs_box.require_key = "widget"; needs_box.require_any = {"ui.checkbox", "ui.radio"};
+packs->add(dks::detect::TemplatePack::load("data/packs/check_state.dkpk", needs_box)); // writes "widget.state"
+pipe.add(std::make_shared<dks::detect::DetectionStage>(packs));
+pipe.add(std::make_shared<dks::latex::LatexStage>(math_classifier));                  // separable
+
+dks::AnalysisContext ctx = pipe.run(frame);
+packs->remove("check_state.knn");       // packs come and go at runtime
+pipe.set_enabled("latex", false);       // so do stages
+```
+
+**Adding a pack.** Train a `TemplatePack` from any labelled crops (`add_example(label, crop)`, `save()`
+to `.dkpk`), or implement `IShapeClassifier` (`name`, `tag_key`, `applies`, `classify`) for a rule. A pack
+declares its scope (element kinds, size, or a tag an earlier pack must have written), so packs chain
+(type → state) without knowing about each other. `screen_pipeline --packs dir` loads every `.dkpk`.
+
+**LaTeX is a separate stage.** It has its own atlas (`data/math_fonts.dksa`, 8.7k glyphs rendered from
+your two math fonts, with math-italic 𝑥 stored as `x` and 𝛼 as `α`), its own segmentation (every symbol on
+its own, stacked parts merged, fraction bars and radicals found structurally), and the spatial parser.
+It only claims regions the text stage did not read as one-baseline text, and only when the math evidence
+passes. `claim_all_text` reads every text box as math, for content known to be formulas.
+
 ## Datasets (what actually works)
 
 | dataset | source used | size | notes |
 |---|---|---|---|
 | Desktop UI Detection (Zenodo 10822752) | `Test Desktop UI Detection Dataset.zip` | 20 MB, 36 screenshots, 6053 boxes | LabelMe JSON; 28 classes; **no text transcriptions** |
 | WebUI | HF datasets-server row API on `biglab/webui-test-elements` (strided, 1 viewport per page) + `js0nwu/webui` GitHub sample | 50 MB cap, 322 pages | `biglab/webui-all` is a ~550 GB split zip — a capped partial download can't be unzipped. Row API rate-limits (429) → fetcher backs off + resumes |
+| im2latex-100k | `yuntian-deng/im2latex-100k` parquet, test + val splits | 64 MB, 12,882 formulas | clean born-digital Computer Modern renders with normalised LaTeX; train split (273 MB) not downloaded |
+| UI widget states | `meghnagera15/checkbox-cropped-binary` (all splits) | 45 MB, 1,700 crops | UI checkboxes / radio buttons, checked vs unchecked |
+| Rico widget crops | `creative-graphic-design/Rico`: semantic annotations (test + validation) for labels, row-API screenshots for pixels | 64 MB, 501 crops, 24 classes | checkbox, switch, slider, stepper, search bar, 18 icon classes (star, search, menu, share, …); the mirror has no `checked` flag and no radio buttons, and Rico checkbox bounds include the row's text label |
 | ICDAR 2013 Robust Reading Ch.1 Born-Digital (train) | HF mirror `Berzerker/born_digital_images_dataset` | 22 MB, 410 images, 4195 words | official portal needs login. Mirror stores boxes as **integer percentages** → boxes are widened to full percent cells; the recogniser trims clipped neighbours |
 
 Links from the original brief that did **not** work: `github.com/ocr-matrix/icdar-born-digital-subset` (404);
@@ -117,6 +190,37 @@ every box: 569 ms single-threaded cold → 138–160 ms cold → **23 ms** on re
 WebUI (323 pages): with verification, ink-tight Text P 0.308 / R 0.281. WebUI "StaticText" boxes are DOM
 element boxes (full-width `<h1>`s, whole `<p>`s, inline `<a>` fragments) and the GT omits most visible text,
 so Zenodo is the meaningful bounding benchmark.
+
+### Detection packs (`bench_packs`, `results/packs.txt`)
+
+| task | pack | test set | accuracy |
+|---|---|---|---:|
+| checkbox / radio state | `TemplatePack` k-NN, trained on 1,300 crops | 400 held-out crops | **0.915** |
+| checkbox / radio state | `CheckStatePack` rule, no training | same 400 | 0.805 |
+| Rico widget / icon type, 23 classes | `TemplatePack` k=3, screen-disjoint split | 272 crops | 0.585 |
+| same, icons pooled into one class | | | **0.772** (icons 0.90, steppers 0.93, switches 0.60) |
+
+Rico is data-limited: rare classes have 1–18 examples, and checkbox / search-bar bounds cover whole rows.
+
+### LaTeX stage (`bench_latex`, `results/latex_*.txt`)
+
+im2latex-100k, whole formula images, compared after canonicalisation (spacing, sizing and font commands,
+synonyms and single-token braces removed from both sides):
+
+| split | formulas | token edit distance / \|gt\| | exact match | symbol P / R / F1 |
+|---|---:|---:|---:|---|
+| test | 6,810 | **0.357** | 4.0 % | 0.817 / 0.743 / **0.778** |
+| val (prior source) | 6,072 | 0.352 | 4.5 % | 0.820 / 0.745 / 0.781 |
+| test, no rescoring / prior | 6,810 | 0.388 | 1.7 % | 0.773 / 0.704 / 0.737 |
+
+0.66 ms per formula. The unigram prior comes from the val split only; the first 500 test formulas were used
+for development. Accents (`\bar \hat \tilde \vec \dot`) are recognised; matrices / arrays, `\left \right`
+growth, and touching glyph pairs are not. Exact match is low because formulas average ~60 tokens and any
+single symbol error fails the whole formula.
+
+Stage gating (layout → text → LaTeX on screens, `bench_latex_stage`): formulas are claimed in 23 % of
+im2latex images with 0.08 false claims per Zenodo desktop and 0.04 per wallpaper. The gate is deliberately
+conservative; raising recall to ~47 % costs about one false claim per screen.
 
 ### What was tried in the improvement round
 
