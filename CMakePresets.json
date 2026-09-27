@@ -1,0 +1,35 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "mingw64",
+      "displayName": "MSYS2 MinGW64 GCC + Ninja (Release)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "C:/msys64/mingw64/bin/gcc.exe",
+        "CMAKE_CXX_COMPILER": "C:/msys64/mingw64/bin/g++.exe",
+        "CMAKE_MAKE_PROGRAM": "ninja"
+      },
+      "environment": {
+        "PATH": "C:/msys64/mingw64/bin;$penv{PATH}"
+      }
+    },
+    {
+      "name": "mingw64-debug",
+      "inherits": "mingw64",
+      "displayName": "MSYS2 MinGW64 GCC + Ninja (Debug)",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "mingw64", "configurePreset": "mingw64" },
+    { "name": "mingw64-debug", "configurePreset": "mingw64-debug" }
+  ],
+  "testPresets": [
+    { "name": "mingw64", "configurePreset": "mingw64", "output": { "outputOnFailure": true } }
+  ]
+}

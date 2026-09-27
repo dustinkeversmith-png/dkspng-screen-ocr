@@ -1,0 +1,196 @@
+<title>dks Box Readings</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --paper:#f5f6f4; --panel:#ffffff; --ink:#17201d; --muted:#5b6762; --rule:#d9ddd9; --soft:#eceeeb;
+  --text:#c8321f; --rej:#8c9591; --icon:#1f63c9; --cont:#b97a0a; --img:#b0339b; --good:#2f7d4f; --bad:#b3261e;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --cond:"IBM Plex Sans Condensed","Arial Narrow",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  color-scheme:dark;--paper:#111513;--panel:#181d1b;--ink:#e6ebe8;--muted:#98a39e;--rule:#2b3330;--soft:#202724;
+  --text:#ff6a55;--rej:#7d8783;--icon:#6ea2ff;--cont:#e0a73a;--img:#e070cf;--good:#63c38a;--bad:#ff7b72;}}
+:root[data-theme="dark"]{
+  color-scheme:dark;--paper:#111513;--panel:#181d1b;--ink:#e6ebe8;--muted:#98a39e;--rule:#2b3330;--soft:#202724;
+  --text:#ff6a55;--rej:#7d8783;--icon:#6ea2ff;--cont:#e0a73a;--img:#e070cf;--good:#63c38a;--bad:#ff7b72;}
+body{background:var(--paper);color:var(--ink);font:15px/1.55 var(--sans);}
+.wrap{max-width:1180px;margin:0 auto;padding-inline:20px;padding-block:28px 64px;display:grid;gap:40px}
+h1,h2,h3{font-family:var(--cond);font-weight:600;text-wrap:balance;margin:0;letter-spacing:.005em}
+h1{font-size:34px;line-height:1.1}
+h2{font-size:24px}
+h3{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-family:var(--sans);font-weight:600}
+p{margin:0;max-width:68ch}
+.lede{display:grid;gap:12px}
+.lede p{color:var(--muted)}
+.mono,td.num,.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:13px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{width:14px;height:10px;border:2px solid currentColor;border-radius:1px;display:inline-block}
+.tables{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}
+.card{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:16px;display:grid;gap:10px;align-content:start}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-weight:600;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}
+td.num,th.num{text-align:right}
+.delta-up{color:var(--good)} .delta-down{color:var(--bad)}
+section.screen{display:grid;gap:14px;padding-top:28px;border-top:1px solid var(--rule)}
+.head{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:baseline;justify-content:space-between}
+.meta{display:flex;flex-wrap:wrap;gap:6px}
+.pill{font:500 12px/1 var(--mono);padding:5px 8px;border-radius:99px;background:var(--soft);color:var(--ink);white-space:nowrap}
+.pill b{font-weight:500;color:var(--muted)}
+.shot{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:18px;align-items:start}
+@media (max-width:860px){.shot{grid-template-columns:1fr}}
+.shot img{width:100%;height:auto;border:1px solid var(--rule);border-radius:4px;background:#fff;display:block}
+.filters{display:flex;flex-wrap:wrap;gap:6px}
+.filters button{font:500 12.5px var(--sans);border:1px solid var(--rule);background:var(--panel);color:var(--ink);padding:5px 10px;border-radius:99px;cursor:pointer}
+.filters button[aria-pressed="true"]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.filters button:focus-visible{outline:2px solid var(--icon);outline-offset:2px}
+.boxes{max-height:560px;overflow:auto;border:1px solid var(--rule);border-radius:4px;background:var(--panel)}
+.boxes table{font-size:13px}
+.boxes thead th{position:sticky;top:0;background:var(--panel)}
+.kind{font:600 11px var(--sans);text-transform:uppercase;letter-spacing:.06em}
+.k-text{color:var(--text)} .k-rej{color:var(--rej)} .k-Icon{color:var(--icon)} .k-Container{color:var(--cont)} .k-Image{color:var(--img)}
+.reading{font-family:var(--mono);word-break:break-word}
+.reading.dim{color:var(--muted)}
+.conf{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:12px}
+.bar{width:44px;height:6px;background:var(--soft);border-radius:3px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--ink)}
+.e2e .ok{color:var(--good)} .e2e .miss{color:var(--bad)}
+.note{font-size:13px;color:var(--muted)}
+</style>
+
+<div class="wrap">
+  <header class="lede">
+    <h1>dks box readings</h1>
+    <p>Each screenshot goes through layout analysis, then the deterministic recogniser reads <em>every</em> detected box, whatever its kind. A box counts as text only when its reading looks like text: at least three glyphs, 70% letters or digits, a template distance of 22 or less, and glyphs sitting on one fitted baseline.</p>
+    <div class="legend" aria-label="Overlay colours">
+      <span style="color:var(--text)"><i class="sw"></i>verified text</span>
+      <span style="color:var(--rej)"><i class="sw"></i>layout text rejected by OCR</span>
+      <span style="color:var(--icon)"><i class="sw"></i>icon</span>
+      <span style="color:var(--cont)"><i class="sw"></i>container</span>
+      <span style="color:var(--img)"><i class="sw"></i>image</span>
+    </div>
+  </header>
+
+  <section class="bench" id="bench" hidden>
+    <h2>Benchmarks</h2>
+    <div class="tables" id="bench-tables"></div>
+  </section>
+
+  <div id="screens" style="display:grid;gap:36px"></div>
+</div>
+
+<script>
+const DATA = /*__DATA__*/null;
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+// ---------------------------------------------------------------- benchmark summary
+function parseSeg(txt, name) {
+  if (!txt) return null;
+  const blocks = txt.split(/\n(?===)/);
+  const b = blocks.find(x => x.startsWith("== " + name + " ") || x.startsWith("\n== " + name + " ") || x.includes("== " + name + " ["));
+  if (!b) return null;
+  const rows = {};
+  for (const line of b.split("\n")) {
+    const m = line.match(/^\s{2}(Text|Icon|Image|Container|All)\s+(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/);
+    if (m) rows[m[1]] = {gt:+m[2], pred:+m[3], r:+m[4], p:+m[5], r75:+m[6], f1:+m[7]};
+  }
+  const ms = (b.match(/([\d.]+) ms\/frame/) || [])[1];
+  return {rows, ms};
+}
+function benchTables() {
+  const B = DATA.bench || {};
+  const out = [];
+  const after = parseSeg(B["segment.txt"], "zenodo"), before = parseSeg(B["segment_layout_only.txt"], "zenodo");
+  if (after && before) {
+    let h = `<div class="card"><h3>Zenodo desktop UI · 36 screenshots</h3><div class="scroll"><table>
+      <thead><tr><th>Class</th><th class="num">P@.5 layout</th><th class="num">P@.5 +OCR</th><th class="num">R@.5 layout</th><th class="num">R@.5 +OCR</th><th class="num">F1 +OCR</th></tr></thead><tbody>`;
+    for (const k of ["Text","Icon","Container","Image","All"]) {
+      const a = after.rows[k], b = before.rows[k]; if (!a || !b) continue;
+      const cls = (x,y) => x > y + 0.005 ? "delta-up" : (x < y - 0.005 ? "delta-down" : "");
+      h += `<tr><td>${k}</td><td class="num">${b.p.toFixed(3)}</td><td class="num ${cls(a.p,b.p)}">${a.p.toFixed(3)}</td>
+            <td class="num">${b.r.toFixed(3)}</td><td class="num ${cls(a.r,b.r)}">${a.r.toFixed(3)}</td><td class="num">${a.f1.toFixed(3)}</td></tr>`;
+    }
+    h += `</tbody></table></div><p class="note">“layout” = geometry only; “+OCR” = boxes kept or promoted by the reading pass.</p></div>`;
+    out.push(h);
+  }
+  const neg = B["negatives_wallpapers.txt"];
+  if (neg) {
+    const s = parseSeg(neg, (neg.match(/== (\S+)/) || [])[1]);
+    const nimg = +((neg.match(/\((\d+) images/) || [])[1] || 1);
+    if (s) {
+      let h = `<div class="card"><h3>${nimg} stock Windows wallpapers · no UI, no text</h3><div class="scroll"><table>
+        <thead><tr><th>False boxes</th><th class="num">Count</th><th class="num">Per image</th></tr></thead><tbody>`;
+      for (const k of ["Text","Icon","Container","Image"]) if (s.rows[k])
+        h += `<tr><td>${k}</td><td class="num">${s.rows[k].pred}</td><td class="num">${(s.rows[k].pred/nimg).toFixed(1)}</td></tr>`;
+      h += `</tbody></table></div><p class="note">Without the OCR pass and icon saliency check the same set produced about 5,600 text and 700 icon boxes. Most remaining “images” are genuine photos in the Spotlight set.</p></div>`;
+      out.push(h);
+    }
+  }
+  const ocr = B["ocr.txt"];
+  if (ocr) {
+    const re = /== (\S+)\s+n=(\d+)[^\n]*\n\s+CER ([\d.]+)\s+\|\s+CER\(case-insens\.\) ([\d.]+)\s+\|\s+EM ([\d.]+)/g;
+    let m, h = `<div class="card"><h3>Word / line recognition</h3><div class="scroll"><table>
+      <thead><tr><th>Set</th><th class="num">n</th><th class="num">CER</th><th class="num">Exact</th></tr></thead><tbody>`, n = 0;
+    while ((m = re.exec(ocr))) { h += `<tr><td>${esc(m[1])}</td><td class="num">${m[2]}</td><td class="num">${(+m[3]).toFixed(3)}</td><td class="num">${(+m[5]).toFixed(3)}</td></tr>`; n++; }
+    h += `</tbody></table></div></div>`;
+    if (n) out.push(h);
+  }
+  if (out.length) { document.getElementById("bench-tables").innerHTML = out.join(""); document.getElementById("bench").hidden = false; }
+}
+
+// ---------------------------------------------------------------- screens
+const FILTERS = [["text","Verified text"],["rej","Rejected text"],["Icon","Icons"],["Container","Containers"],["Image","Images"],["all","All boxes"]];
+function cat(b) { return b.text_ok ? "text" : (b.kind === "Text" ? "rej" : b.kind); }
+function kindLabel(b) {
+  if (b.text_ok) return `<span class="kind k-text">${b.kind === "Text" ? "text" : "text · " + esc(b.kind.toLowerCase())}</span>`;
+  if (b.kind === "Text") return `<span class="kind k-rej">rejected</span>`;
+  return `<span class="kind k-${b.kind}">${esc(b.kind.toLowerCase())}</span>`;
+}
+function rowsFor(s, f) {
+  const list = s.boxes.filter(b => f === "all" || cat(b) === f).sort((a,b) => a.y - b.y || a.x - b.x);
+  if (!list.length) return `<tr><td colspan="4" class="note">No boxes in this group.</td></tr>`;
+  return list.map(b => `<tr><td>${kindLabel(b)}</td><td class="num">${b.x},${b.y}<br>${b.w}×${b.h}</td>
+    <td><div class="conf"><span class="bar"><i style="width:${Math.round(b.conf*100)}%"></i></span>${b.conf.toFixed(2)}</div></td>
+    <td class="reading ${b.text_ok ? "" : "dim"}">${b.text ? esc(b.text) : "<span class='note'>(no glyphs)</span>"}</td></tr>`).join("");
+}
+function renderScreen(s, i) {
+  const el = document.createElement("section");
+  el.className = "screen";
+  el.id = "screen-" + i;
+  const counts = Object.entries(s.kinds).map(([k,v]) => `<span class="pill"><b>${esc(k)}</b> ${v}</span>`).join("");
+  let e2e = "";
+  if (s.e2e) {
+    e2e = `<div class="card e2e"><h3>End-to-end against text ground truth · CER ${s.e2e.cer.toFixed(3)} · exact ${Math.round(s.e2e.em*100)}% of ${s.e2e.n} lines</h3>
+      <div class="scroll"><table><thead><tr><th>Ground truth</th><th>Read</th><th class="num">IoU</th><th class="num">CER</th></tr></thead><tbody>` +
+      s.e2e.rows.map(r => `<tr><td class="reading">${esc(r.gt)}</td><td class="reading ${r.read ? (r.cer === 0 ? "ok" : "") : "miss"}">${r.read ? esc(r.read) : "not found"}</td>
+        <td class="num">${r.iou.toFixed(2)}</td><td class="num">${r.cer.toFixed(2)}</td></tr>`).join("") + `</tbody></table></div><p class="note">Each ground-truth text node is matched to the verified box with the best IoU (at least 0.3). Inline links are separate nodes in this ground truth, so a link inside a sentence counts as a miss even when the sentence around it is read correctly.</p></div>`;
+  }
+  el.innerHTML = `
+    <div class="head"><h2>${esc(s.label)}</h2>
+      <div class="meta"><span class="pill"><b>size</b> ${s.size[0]}×${s.size[1]}</span><span class="pill"><b>layout+OCR</b> ${esc(s.ms)} ms</span>
+      <span class="pill"><b>verified text</b> ${s.verified}</span><span class="pill"><b>rejected</b> ${s.rejected}</span>${counts}</div></div>
+    <div class="shot">
+      <img src="${s.overlay}" alt="Detection overlay for ${esc(s.label)}" loading="lazy">
+      <div style="display:grid;gap:10px">
+        <div class="filters" role="group" aria-label="Filter boxes">${FILTERS.map(([k,l]) =>
+          `<button type="button" id="f-${i}-${k}" data-f="${k}" aria-pressed="${k === "text"}">${l} <span class="mono">${k === "all" ? s.boxes.length : s.boxes.filter(b => cat(b) === k).length}</span></button>`).join("")}</div>
+        <div class="boxes"><table><thead><tr><th>Kind</th><th class="num">Box</th><th>Conf.</th><th>Reading</th></tr></thead><tbody>${rowsFor(s,"text")}</tbody></table></div>
+      </div>
+    </div>${e2e}`;
+  el.querySelectorAll(".filters button").forEach(btn => btn.addEventListener("click", () => {
+    el.querySelectorAll(".filters button").forEach(b => b.setAttribute("aria-pressed", String(b === btn)));
+    el.querySelector(".boxes tbody").innerHTML = rowsFor(s, btn.dataset.f);
+  }));
+  return el;
+}
+
+if (DATA) {
+  benchTables();
+  const host = document.getElementById("screens");
+  DATA.screens.forEach((s, i) => host.appendChild(renderScreen(s, i)));
+}
+</script>

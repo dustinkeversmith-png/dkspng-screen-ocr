@@ -1,0 +1,6 @@
+atlas: 45 fonts, 69660 raw -> 59582 templates after prune(3.0)  [load 374 ms, prune 79 ms]
+classifier: vp-tree (build 30 ms)
+
+== icdar_bd      n=306 (skipped 2)
+   CER 0.465  | CER(case-insens.) 0.450  | EM 0.428  | EM(ci) 0.444
+   10.241 ms/crop, 1927.2 us/glyph, 75586 distance evals/glyph

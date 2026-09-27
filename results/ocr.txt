@@ -1,0 +1,18 @@
+atlas: 45 fonts, 69660 raw -> 59582 templates after prune(3.0)  [load 418 ms, prune 92 ms]
+classifier: aspect-sorted (build 10 ms)
+
+== synth/seen    n=600 (skipped 0)
+   CER 0.059  | CER(case-insens.) 0.045  | EM 0.763  | EM(ci) 0.807
+   9.927 ms/crop, 1229.4 us/glyph, 19865 distance evals/glyph
+
+== synth/unseen  n=600 (skipped 0)
+   CER 0.103  | CER(case-insens.) 0.085  | EM 0.653  | EM(ci) 0.707
+   9.636 ms/crop, 1208.5 us/glyph, 21024 distance evals/glyph
+
+== icdar_bd      n=4195 (skipped 30)
+   CER 0.397  | CER(case-insens.) 0.379  | EM 0.391  | EM(ci) 0.409
+   5.900 ms/crop, 1159.6 us/glyph, 17623 distance evals/glyph
+
+== webui         n=84 (skipped 9)
+   CER 0.033  | CER(case-insens.) 0.024  | EM 0.810  | EM(ci) 0.833
+   12.455 ms/crop, 1008.9 us/glyph, 18211 distance evals/glyph

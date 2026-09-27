@@ -1,0 +1,7 @@
+== negatives [layout+OCR verify]  (28 images, 133.3 ms/frame avg, 2440 CCL atoms/frame)
+  Text                        0      4    0.000    0.000    0.000    0.000    0.000
+  Icon                        0    121    0.000    0.000    0.000    0.000    0.000
+  Image                       0     61    0.000    0.000    0.000    0.000    0.000
+  Container                   0     21    0.000    0.000    0.000    0.000    0.000
+  Text (as words)             0      4    0.000    0.000    0.000    0.000    0.000
+  Text (as blocks)            0      4    0.000    0.000    0.000    0.000    0.000

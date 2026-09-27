@@ -1,0 +1,45 @@
+
+== zenodo [layout+OCR verify]  (36 images, 241.1 ms/frame avg, 497 CCL atoms/frame)
+  element bounding         n_gt n_pred    R@.50    P@.50    R@.75   F1@.50     mIoU
+  Text                     2384   2315    0.780    0.803    0.632    0.792    0.679
+  Icon                     2618   2585    0.787    0.797    0.678    0.792    0.674
+  Image                     136    109    0.147    0.183    0.096    0.163    0.145
+  Container                 915    980    0.540    0.504    0.419    0.521    0.505
+  All                      6053   5989    0.775    0.784    0.647    0.780    0.690
+  Text (as words)          2384   2499    0.777    0.741    0.622    0.759    0.677
+  Text (as blocks)         2384   1622    0.556    0.817    0.441    0.662    0.483
+  text grouping               1:1    split    merge     miss  overlap
+  lines                     0.800    0.054    0.010    0.146    0.723
+  words                     0.782    0.081    0.005    0.137    0.730
+  blocks                    0.575    0.014    0.048    0.411    0.490
+  containment: matched 4694, depth precision 0.343, parent precision 0.444
+
+== webui [layout+OCR verify]  (323 images, 205.4 ms/frame avg, 839 CCL atoms/frame)
+  element bounding         n_gt n_pred    R@.50    P@.50    R@.75   F1@.50     mIoU
+  Text                     9774   6952    0.147    0.206    0.076    0.172    0.181
+  Icon                        0   3431    0.000    0.000    0.000    0.000    0.000
+  Image                     520   2475    0.060    0.013    0.031    0.021    0.081
+  Container                 914   2918    0.079    0.025    0.055    0.038    0.091
+  All                     11652  15776    0.171    0.126    0.085    0.145    0.212
+  Text (as words)          9774  10967    0.161    0.144    0.083    0.152    0.190
+  Text (as blocks)         9774   6166    0.112    0.177    0.057    0.137    0.129
+  text grouping               1:1    split    merge     miss  overlap
+  lines                     0.263    0.060    0.058    0.677    0.185
+  words                     0.268    0.086    0.033    0.646    0.201
+  blocks                    0.195    0.031    0.063    0.774    0.119
+  containment: matched 1988, depth precision 0.292, parent precision 0.257
+
+== webui [ink-tight GT] [layout+OCR verify]  (323 images, 205.8 ms/frame avg, 839 CCL atoms/frame)
+  element bounding         n_gt n_pred    R@.50    P@.50    R@.75   F1@.50     mIoU
+  Text                     7618   6952    0.281    0.308    0.222    0.294    0.318
+  Icon                        0   3431    0.000    0.000    0.000    0.000    0.000
+  Image                     411   2475    0.102    0.017    0.058    0.029    0.124
+  Container                 712   2918    0.079    0.019    0.060    0.031    0.097
+  All                      9115  15776    0.304    0.176    0.233    0.222    0.352
+  Text (as words)          7618  10967    0.303    0.211    0.236    0.248    0.333
+  Text (as blocks)         7618   6166    0.206    0.254    0.161    0.227    0.225
+  text grouping               1:1    split    merge     miss  overlap
+  lines                     0.334    0.077    0.071    0.589    0.330
+  words                     0.341    0.110    0.041    0.549    0.355
+  blocks                    0.248    0.040    0.071    0.712    0.216
+  containment: matched 2769, depth precision 0.266, parent precision 0.230
