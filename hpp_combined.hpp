@@ -204,15 +204,20 @@ public:
     ScreenRead read(const ColorView& frame) const {
         ScreenRead out;
         out.layout = analyze_layout(frame, lp_);
-        const Gray8 gray = to_luma(frame);
-        out.elements.resize(out.layout.elements.size());
+        out.elements = read_boxes(out.layout, to_luma(frame));
+        return out;
+    }
+
+    // OCR pass over an existing layout (used by the pipeline's TextReadStage).
+    std::vector<ReadElement> read_boxes(const Layout& layout, const Gray8& gray) const {
+        std::vector<ReadElement> elements(layout.elements.size());
         auto work = [&](size_t t) {
             const ocr::Recognizer rec(cls_[t], rp_);
             // Static striping: box i always lands on thread i % T, so each thread's memo sees the
             // same boxes frame after frame (dynamic scheduling scatters them and misses the cache).
-            for (size_t i = t; i < out.elements.size(); i += cls_.size()) {
-                ReadElement& re = out.elements[i];
-                const Element& e = out.layout.elements[i];
+            for (size_t i = t; i < elements.size(); i += cls_.size()) {
+                ReadElement& re = elements[i];
+                const Element& e = layout.elements[i];
                 re.element = e;
                 if (e.bbox.h > vp_.max_height) continue;
                 const Rect r = e.bbox.inflate(2).clip(gray.width(), gray.height());
@@ -229,7 +234,7 @@ public:
             for (size_t t = 0; t < cls_.size(); ++t) pool.emplace_back(work, t);
             for (auto& th : pool) th.join();
         }
-        return out;
+        return elements;
     }
 
     // Aggregate classifier counters over all thread copies.
@@ -491,6 +496,589 @@ inline std::string utf8_encode(std::u32string_view s) {
 }
 
 }  // namespace dks
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\detection\detection_pack.hpp ===
+#pragma once
+// Pluggable shape / widget classification packs.
+//
+//   IShapeClassifier   one pack = one classification concern ("widget type", "checkbox state", ...)
+//   TemplatePack       exemplar k-NN over ShapeDescriptors; trainable from labelled crops, saved as .dkpk
+//   PackRegistry       ordered, mutable set of packs (add / remove / replace at runtime)
+//   DetectionStage     pipeline stage: runs every registered pack over the elements it applies to and
+//                      attaches {pack.tag_key(), match.tag} SemanticTags
+//
+// A pack decides what it looks at through applies(): element kinds + size limits, and optionally a
+// required tag written by an earlier pack (e.g. a state pack only runs on boxes tagged ui.checkbox).
+// The core layout / OCR code never sees any of this.
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "../pipeline/pipeline_stage.hpp"
+#include "shape_descriptor.hpp"
+
+namespace dks::detect {
+
+struct ShapeMatch {
+    std::string tag;         // e.g. "ui.checkbox", "checked", "icon.search", "math.integral"
+    float confidence = 0.f;  // 0..1
+    uint32_t class_id = 0;
+};
+
+// What a pack gets to see for one element.
+struct Patch {
+    GrayView luma;                         // element crop (with a small margin)
+    Rect box;                              // element box in frame coordinates
+    ElementKind kind = ElementKind::Icon;
+    const std::vector<SemanticTag>* tags = nullptr;  // tags written so far (may be null)
+
+    const SemanticTag* tag(const std::string& key) const {
+        if (!tags) return nullptr;
+        for (const auto& t : *tags)
+            if (t.key == key) return &t;
+        return nullptr;
+    }
+};
+
+class IShapeClassifier {
+public:
+    virtual ~IShapeClassifier() = default;
+    virtual std::string name() const = 0;     // unique pack name
+    virtual std::string tag_key() const = 0;  // SemanticTag key the pack writes
+    virtual bool applies(const Patch& p) const = 0;
+    virtual std::vector<ShapeMatch> classify(const Patch& p) const = 0;
+};
+
+// Applicability filter shared by the built-in packs.
+struct PackScope {
+    std::vector<ElementKind> kinds{ElementKind::Icon, ElementKind::Container, ElementKind::Image};
+    int min_side = 8, max_side = 160;
+    std::string require_key;               // only run when this tag key exists ...
+    std::vector<std::string> require_any;  // ... with one of these values (empty = any value)
+
+    bool ok(const Patch& p) const {
+        if (std::find(kinds.begin(), kinds.end(), p.kind) == kinds.end()) return false;
+        if (std::min(p.box.w, p.box.h) < min_side || std::max(p.box.w, p.box.h) > max_side) return false;
+        if (!require_key.empty()) {
+            const SemanticTag* t = p.tag(require_key);
+            if (!t) return false;
+            if (!require_any.empty() && std::find(require_any.begin(), require_any.end(), t->value) == require_any.end())
+                return false;
+        }
+        return true;
+    }
+};
+
+// ------------------------------------------------------------------------------------ TemplatePack
+// Exemplar k-NN. Deterministic: distance ties break by exemplar index, vote ties by class id.
+class TemplatePack : public IShapeClassifier {
+public:
+    TemplatePack(std::string name, std::string tag_key, PackScope scope = {}, int k = 5, ShapeWeights w = {})
+        : name_(std::move(name)), key_(std::move(tag_key)), scope_(std::move(scope)), k_(k), w_(w) {}
+
+    std::string name() const override { return name_; }
+    std::string tag_key() const override { return key_; }
+    PackScope& scope() noexcept { return scope_; }
+    const std::vector<std::string>& classes() const noexcept { return classes_; }
+    size_t size() const noexcept { return ex_.size(); }
+
+    uint32_t class_id(const std::string& label) {
+        for (uint32_t i = 0; i < classes_.size(); ++i)
+            if (classes_[i] == label) return i;
+        classes_.push_back(label);
+        return uint32_t(classes_.size() - 1);
+    }
+    void add_example(const std::string& label, GrayView crop) { ex_.push_back({describe(crop), class_id(label)}); }
+    void add_example(const std::string& label, const ShapeDescriptor& d) { ex_.push_back({d, class_id(label)}); }
+
+    bool applies(const Patch& p) const override { return !ex_.empty() && scope_.ok(p); }
+
+    std::vector<ShapeMatch> classify(const Patch& p) const override { return classify(describe(p.luma)); }
+
+    std::vector<ShapeMatch> classify(const ShapeDescriptor& q) const {
+        std::vector<std::pair<float, uint32_t>> best;  // (distance, exemplar)
+        best.reserve(size_t(k_) + 1);
+        for (uint32_t i = 0; i < ex_.size(); ++i) {
+            const float d = distance(q, ex_[i].d, w_);
+            if (int(best.size()) == k_ && d >= best.back().first) continue;
+            best.emplace_back(d, i);
+            std::sort(best.begin(), best.end());
+            if (int(best.size()) > k_) best.pop_back();
+        }
+        // Distance-weighted vote.
+        std::vector<float> vote(classes_.size(), 0.f);
+        float total = 0.f;
+        for (const auto& [d, i] : best) {
+            const float wgt = 1.f / (1.f + d);
+            vote[ex_[i].cls] += wgt;
+            total += wgt;
+        }
+        std::vector<ShapeMatch> out;
+        for (uint32_t c = 0; c < vote.size(); ++c)
+            if (vote[c] > 0.f) out.push_back({classes_[c], total > 0 ? vote[c] / total : 0.f, c});
+        std::sort(out.begin(), out.end(), [](const ShapeMatch& a, const ShapeMatch& b) {
+            return a.confidence != b.confidence ? a.confidence > b.confidence : a.class_id < b.class_id;
+        });
+        return out;
+    }
+
+    // ".dkpk": "DKPK" u32 ver=1 | name | tag_key | u32 k | u32 n_classes {str} | u32 n {u16 cls, f32 aspect, f32 fill, 192 u8}
+    bool save(const std::string& path) const {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) return false;
+        auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+        auto str = [&](const std::string& s) { u32(uint32_t(s.size())); std::fwrite(s.data(), 1, s.size(), f); };
+        std::fwrite("DKPK", 1, 4, f);
+        u32(1);
+        str(name_);
+        str(key_);
+        u32(uint32_t(k_));
+        u32(uint32_t(classes_.size()));
+        for (const auto& c : classes_) str(c);
+        u32(uint32_t(ex_.size()));
+        for (const auto& e : ex_) {
+            const uint16_t c = uint16_t(e.cls);
+            std::fwrite(&c, 2, 1, f);
+            std::fwrite(&e.d.log_aspect, 4, 1, f);
+            std::fwrite(&e.d.fill, 4, 1, f);
+            std::fwrite(e.d.hog.data(), 1, kHog, f);
+            std::fwrite(e.d.ink.data(), 1, kInk, f);
+        }
+        return std::fclose(f) == 0;
+    }
+
+    static std::shared_ptr<TemplatePack> load(const std::string& path, PackScope scope = {}) {
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) return nullptr;
+        bool ok = true;
+        auto u32 = [&]() { uint32_t v = 0; ok = ok && std::fread(&v, 4, 1, f) == 1; return v; };
+        auto str = [&]() {
+            const uint32_t n = u32();
+            std::string s(ok ? n : 0, '\0');
+            ok = ok && n < (1u << 20) && std::fread(s.data(), 1, n, f) == n;
+            return s;
+        };
+        char magic[4] = {};
+        ok = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "DKPK", 4) == 0 && u32() == 1;
+        std::shared_ptr<TemplatePack> p;
+        if (ok) {
+            const std::string name = str(), key = str();
+            const int k = int(u32());
+            p = std::make_shared<TemplatePack>(name, key, std::move(scope), k);
+            const uint32_t nc = u32();
+            for (uint32_t i = 0; ok && i < nc; ++i) p->classes_.push_back(str());
+            const uint32_t n = u32();
+            for (uint32_t i = 0; ok && i < n; ++i) {
+                Exemplar e;
+                uint16_t c = 0;
+                ok = std::fread(&c, 2, 1, f) == 1 && std::fread(&e.d.log_aspect, 4, 1, f) == 1 &&
+                     std::fread(&e.d.fill, 4, 1, f) == 1 && std::fread(e.d.hog.data(), 1, kHog, f) == size_t(kHog) &&
+                     std::fread(e.d.ink.data(), 1, kInk, f) == size_t(kInk);
+                e.cls = c;
+                if (ok) p->ex_.push_back(e);
+            }
+        }
+        std::fclose(f);
+        return ok ? p : nullptr;
+    }
+
+private:
+    struct Exemplar {
+        ShapeDescriptor d;
+        uint32_t cls = 0;
+    };
+    std::string name_, key_;
+    PackScope scope_;
+    int k_;
+    ShapeWeights w_;
+    std::vector<std::string> classes_;
+    std::vector<Exemplar> ex_;
+};
+
+// ------------------------------------------------------------------------------------ registry + stage
+class PackRegistry {
+public:
+    // Adds or replaces (same name) a pack; packs run in insertion order, so a pack that requires a
+    // tag must come after the pack that writes it.
+    void add(std::shared_ptr<const IShapeClassifier> pack) {
+        remove(pack->name());
+        packs_.push_back(std::move(pack));
+    }
+    bool remove(const std::string& name) {
+        const auto n = packs_.size();
+        packs_.erase(std::remove_if(packs_.begin(), packs_.end(), [&](const auto& p) { return p->name() == name; }),
+                     packs_.end());
+        return packs_.size() != n;
+    }
+    const std::vector<std::shared_ptr<const IShapeClassifier>>& packs() const noexcept { return packs_; }
+
+private:
+    std::vector<std::shared_ptr<const IShapeClassifier>> packs_;
+};
+
+class DetectionStage : public IPipelineStage {
+public:
+    explicit DetectionStage(std::shared_ptr<const PackRegistry> registry, int margin = 2, float min_confidence = 0.5f)
+        : reg_(std::move(registry)), margin_(margin), min_conf_(min_confidence) {}
+    const char* name() const override { return "detection"; }
+
+    void process(AnalysisContext& ctx) const override {
+        if (!ctx.has_layout) return;
+        const Gray8& luma = ctx.ensure_luma();
+        if (ctx.tags.size() < ctx.layout.elements.size()) ctx.tags.resize(ctx.layout.elements.size());
+        for (size_t i = 0; i < ctx.layout.elements.size(); ++i) {
+            const Element& e = ctx.layout.elements[i];
+            Patch p;
+            p.box = e.bbox;
+            p.kind = e.kind;
+            p.luma = luma.cview().sub(e.bbox.inflate(margin_).clip(luma.width(), luma.height()));
+            for (const auto& pack : reg_->packs()) {
+                p.tags = &ctx.tags[i];  // re-read: earlier packs may have added tags
+                if (!pack->applies(p)) continue;
+                const auto m = pack->classify(p);
+                if (!m.empty() && m.front().confidence >= min_conf_)
+                    ctx.tag(i, pack->tag_key(), m.front().tag, m.front().confidence, pack->name());
+            }
+        }
+    }
+
+private:
+    std::shared_ptr<const PackRegistry> reg_;
+    int margin_;
+    float min_conf_;
+};
+
+}  // namespace dks::detect
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\detection\rule_packs.hpp ===
+#pragma once
+// Training-free packs: deterministic rules for specific widgets.
+#include <algorithm>
+#include <cstdlib>
+
+#include "../segment/ccl.hpp"
+#include "detection_pack.hpp"
+
+namespace dks::detect {
+
+// Checkbox / radio state from the control's interior.
+//   1. background = patch border median; control = largest component of |luma - bg| > delta
+//   2. interior  = central `inner` fraction of the control's bbox
+//   3. checked   <=> the interior contains a mark: its luma spread (p95 - p5) exceeds `delta`.
+//      An unchecked control has a uniform interior (page background or its own fill colour); a tick,
+//      a radio dot or a filled box with a tick all create contrast *inside* the interior.
+class CheckStatePack : public IShapeClassifier {
+public:
+    explicit CheckStatePack(PackScope scope = {}, int delta = 40, float inner = 0.6f)
+        : scope_(std::move(scope)), delta_(delta), inner_(inner) {}
+    std::string name() const override { return "check_state.rule"; }
+    std::string tag_key() const override { return "widget.state"; }
+    bool applies(const Patch& p) const override { return scope_.ok(p); }
+
+    std::vector<ShapeMatch> classify(const Patch& p) const override {
+        const int spread = interior_spread(p.luma);
+        if (spread < 0) return {};
+        const bool checked = spread > delta_;
+        // Confidence grows with the distance from the decision threshold.
+        const float conf = std::clamp(0.5f + float(std::abs(spread - delta_)) / 120.f, 0.5f, 1.f);
+        return {{checked ? "checked" : "unchecked", conf, checked ? 0u : 1u}};
+    }
+
+    // p95 - p5 luma inside the control's interior; -1 when no control is found.
+    int interior_spread(GrayView g) const {
+        if (g.width < 4 || g.height < 4) return -1;
+        const int bg = border_median(g);
+        Gray8 mask(g.width, g.height, 0);
+        for (int32_t y = 0; y < g.height; ++y)
+            for (int32_t x = 0; x < g.width; ++x) mask.at(x, y) = std::abs(int(g.at(x, y)) - bg) > delta_;
+        const LabelResult L = label_components(mask.cview(), Connectivity::Eight);
+        Rect b{0, 0, g.width, g.height};  // tight crops: the control is the whole patch
+        if (!L.components.empty()) {
+            const Component* big = &L.components[0];
+            for (const auto& c : L.components)
+                if (c.bbox.area() > big->bbox.area()) big = &c;
+            if (big->bbox.w >= g.width / 3 && big->bbox.h >= g.height / 3) b = big->bbox;
+        }
+        const int32_t iw = std::max<int32_t>(1, int32_t(float(b.w) * inner_)), ih = std::max<int32_t>(1, int32_t(float(b.h) * inner_));
+        const Rect in{b.x + (b.w - iw) / 2, b.y + (b.h - ih) / 2, iw, ih};
+        int hist[256] = {};
+        int n = 0;
+        for (int32_t y = in.y; y < in.bottom(); ++y)
+            for (int32_t x = in.x; x < in.right(); ++x) ++hist[g.at(x, y)], ++n;
+        auto pct = [&](int q) {
+            int acc = 0;
+            for (int v = 0; v < 256; ++v)
+                if ((acc += hist[v]) * 100 >= q * n) return v;
+            return 255;
+        };
+        return n ? pct(95) - pct(5) : -1;
+    }
+
+private:
+    PackScope scope_;
+    int delta_;
+    float inner_;
+};
+
+}  // namespace dks::detect
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\detection\shape_descriptor.hpp ===
+#pragma once
+// ShapeDescriptor: a colour- and polarity-agnostic visual vector for widgets, icons and marks.
+//
+//   hog[128]   4x4 cells x 8 unsigned gradient orientations on a 24x24 area-resampled luma patch
+//              (unsigned = light-on-dark and dark-on-light give the same histogram), L1-normalised
+//   ink[64]    8x8 map of |luma - background| (background = patch border median), peak-normalised
+//   log_aspect, fill (share of pixels deviating from the background)
+//
+// Distance: L1(hog) + L1(ink) + W_aspect * |d log2 aspect| + W_fill * |d fill|  (a metric).
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
+
+#include "../core/image.hpp"
+
+namespace dks::detect {
+
+constexpr int kHog = 128, kInk = 64;
+
+struct ShapeDescriptor {
+    std::array<uint8_t, kHog> hog{};
+    std::array<uint8_t, kInk> ink{};
+    float log_aspect = 0.f;
+    float fill = 0.f;
+};
+
+struct ShapeWeights {
+    float hog = 1.f, ink = 0.6f, aspect = 40.f, fill = 60.f;
+};
+
+// Area resample of an arbitrary patch to an n x n float grid.
+inline void resample(GrayView g, int n, float* out) {
+    for (int i = 0; i < n * n; ++i) out[i] = 0.f;
+    const float sx = float(g.width) / float(n), sy = float(g.height) / float(n);
+    for (int oy = 0; oy < n; ++oy) {
+        const float y0 = float(oy) * sy, y1 = y0 + sy;
+        for (int ox = 0; ox < n; ++ox) {
+            const float x0 = float(ox) * sx, x1 = x0 + sx;
+            float acc = 0.f, wsum = 0.f;
+            for (int32_t y = int32_t(y0); y < int32_t(std::ceil(y1)) && y < g.height; ++y) {
+                const float wy = std::min(y1, float(y + 1)) - std::max(y0, float(y));
+                if (wy <= 0.f) continue;
+                for (int32_t x = int32_t(x0); x < int32_t(std::ceil(x1)) && x < g.width; ++x) {
+                    const float wx = std::min(x1, float(x + 1)) - std::max(x0, float(x));
+                    if (wx <= 0.f) continue;
+                    acc += wx * wy * float(g.at(x, y));
+                    wsum += wx * wy;
+                }
+            }
+            out[oy * n + ox] = wsum > 0.f ? acc / wsum : 0.f;
+        }
+    }
+}
+
+inline int border_median(GrayView g) {
+    std::vector<uint8_t> b;
+    for (int32_t x = 0; x < g.width; ++x) b.push_back(g.at(x, 0)), b.push_back(g.at(x, g.height - 1));
+    for (int32_t y = 1; y + 1 < g.height; ++y) b.push_back(g.at(0, y)), b.push_back(g.at(g.width - 1, y));
+    if (b.empty()) return 0;
+    std::nth_element(b.begin(), b.begin() + ptrdiff_t(b.size() / 2), b.end());
+    return b[b.size() / 2];
+}
+
+inline ShapeDescriptor describe(GrayView g, int fill_delta = 32) {
+    ShapeDescriptor d;
+    if (g.width < 2 || g.height < 2) return d;
+    d.log_aspect = std::log2(float(g.width) / float(g.height));
+    const int bg = border_median(g);
+    int64_t dev = 0;
+    for (int32_t y = 0; y < g.height; ++y)
+        for (int32_t x = 0; x < g.width; ++x) dev += std::abs(int(g.at(x, y)) - bg) > fill_delta;
+    d.fill = float(dev) / float(g.width * g.height);
+
+    constexpr int N = 24;
+    float p[N * N];
+    resample(g, N, p);
+
+    // HOG-lite: central differences, unsigned orientation (0..180 deg) into 8 bins, 4x4 cells of 6x6.
+    float hog[kHog] = {};
+    for (int y = 0; y < N; ++y)
+        for (int x = 0; x < N; ++x) {
+            const float gx = p[y * N + std::min(N - 1, x + 1)] - p[y * N + std::max(0, x - 1)];
+            const float gy = p[std::min(N - 1, y + 1) * N + x] - p[std::max(0, y - 1) * N + x];
+            const float mag = std::sqrt(gx * gx + gy * gy);
+            if (mag <= 0.f) continue;
+            float ang = std::atan2(gy, gx);
+            if (ang < 0) ang += 3.14159265f;
+            const int bin = std::min(7, int(ang / 3.14159265f * 8.f));
+            hog[((y / 6) * 4 + (x / 6)) * 8 + bin] += mag;
+        }
+    float hs = 0.f;
+    for (float v : hog) hs += v;
+    for (int i = 0; i < kHog; ++i) d.hog[size_t(i)] = uint8_t(hs > 0 ? std::min(255.f, hog[i] / hs * 255.f * 16.f) : 0.f);
+
+    // Ink map: |luma - background| on an 8x8 grid, peak-normalised.
+    float ink[kInk];
+    for (int cy = 0; cy < 8; ++cy)
+        for (int cx = 0; cx < 8; ++cx) {
+            float s = 0.f;
+            for (int y = cy * 3; y < cy * 3 + 3; ++y)
+                for (int x = cx * 3; x < cx * 3 + 3; ++x) s += std::fabs(p[y * N + x] - float(bg));
+            ink[cy * 8 + cx] = s / 9.f;
+        }
+    float mx = 0.f;
+    for (float v : ink) mx = std::max(mx, v);
+    for (int i = 0; i < kInk; ++i) d.ink[size_t(i)] = uint8_t(mx > 0 ? ink[i] / mx * 255.f : 0.f);
+    return d;
+}
+
+inline float distance(const ShapeDescriptor& a, const ShapeDescriptor& b, const ShapeWeights& w = {}) {
+    uint32_t h = 0, k = 0;
+    for (int i = 0; i < kHog; ++i) h += uint32_t(std::abs(int(a.hog[size_t(i)]) - int(b.hog[size_t(i)])));
+    for (int i = 0; i < kInk; ++i) k += uint32_t(std::abs(int(a.ink[size_t(i)]) - int(b.ink[size_t(i)])));
+    return w.hog * float(h) / 255.f + w.ink * float(k) / 255.f + w.aspect * std::fabs(a.log_aspect - b.log_aspect) +
+           w.fill * std::fabs(a.fill - b.fill);
+}
+
+}  // namespace dks::detect
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\eval\latex_metrics.hpp ===
+#pragma once
+// LaTeX comparison for im2latex-style token strings.
+//
+// Both sides are canonicalised first, removing notation that does not change the rendered symbols or
+// their 2D structure: spacing (\, \; \quad ~ \hspace{..}), sizing (\left \right \big ...), style / font
+// switches (\bf \mathrm \cal \displaystyle ...), synonyms (\le -> \leq, \to -> \rightarrow, \lbrack -> [),
+// dot spellings (\dots \ldots \cdots ". . .") and braces around a single token ("{ x }" -> "x").
+//
+//   token edit distance / |gt|, exact match      structure + symbols
+//   symbol-bag precision / recall / F1           symbols only (ignores { } ^ _ \frac \sqrt ...)
+#include <algorithm>
+#include <map>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace dks::eval {
+
+inline std::vector<std::string> latex_canonical(const std::string& s) {
+    static const std::set<std::string> drop = {
+        "\\,", "\\;", "\\:", "\\!", "\\quad", "\\qquad", "~", "\\", "\\ ", "\\displaystyle", "\\textstyle", "\\scriptstyle",
+        "\\scriptscriptstyle", "\\nonumber", "\\big", "\\Big", "\\bigg", "\\Bigg", "\\bigl", "\\bigr", "\\Bigl", "\\Bigr",
+        "\\biggl", "\\biggr", "\\Biggl", "\\Biggr", "\\left", "\\right", "\\left.", "\\right.", "\\limits", "\\nolimits",
+        "\\bf", "\\rm", "\\it", "\\cal", "\\mathrm", "\\mathcal", "\\mathbf", "\\mathit", "\\mathsf", "\\sf", "\\boldmath",
+        "\\operatorname", "\\operatorname*", "\\textrm", "\\mbox", "\\hbox", "\\text", "\\mathtt", "\\tt", "\\emph", "\\mit",
+        "\\tiny", "\\small", "\\scriptsize", "\\footnotesize", "\\protect"};
+    static const std::map<std::string, std::string> syn = {
+        {"\\left(", "("}, {"\\right)", ")"}, {"\\left[", "["}, {"\\right]", "]"}, {"\\left\\{", "\\{"}, {"\\right\\}", "\\}"},
+        {"\\left|", "|"}, {"\\right|", "|"}, {"\\left<", "\\langle"}, {"\\right>", "\\rangle"}, {"\\left\\langle", "\\langle"},
+        {"\\right\\rangle", "\\rangle"}, {"\\left\\|", "\\Vert"}, {"\\right\\|", "\\Vert"}, {"\\|", "\\Vert"},
+        {"\\left\\vert", "|"}, {"\\right\\vert", "|"}, {"\\vert", "|"}, {"\\mid", "|"}, {"\\lbrack", "["}, {"\\rbrack", "]"},
+        {"\\lbrace", "\\{"}, {"\\rbrace", "\\}"}, {"\\le", "\\leq"}, {"\\ge", "\\geq"}, {"\\ne", "\\neq"},
+        {"\\to", "\\rightarrow"}, {"\\dots", "\\cdots"}, {"\\ldots", "\\cdots"}, {"\\prime", "'"}, {"\\ast", "*"},
+        {"\\dag", "\\dagger"}, {"\\sp", "^"}, {"\\sb", "_"}, {"\\over", "\\frac"}, {"\\lgroup", "("}, {"\\rgroup", ")"}};
+    std::vector<std::string> t;
+    std::istringstream in(s);
+    std::string w;
+    std::vector<std::string> raw;
+    while (in >> w) raw.push_back(w);
+    for (size_t i = 0; i < raw.size(); ++i) {
+        std::string x = raw[i];
+        if (x == "\\hspace" || x == "\\vspace" || x == "\\kern") {  // drop the command and its argument group
+            if (i + 1 < raw.size() && raw[i + 1] == "{") {
+                int d = 0;
+                for (++i; i < raw.size(); ++i) {
+                    d += raw[i] == "{" ? 1 : raw[i] == "}" ? -1 : 0;
+                    if (d == 0) break;
+                }
+            }
+            continue;
+        }
+        const auto it = syn.find(x);
+        if (it != syn.end()) x = it->second;
+        if (drop.count(x)) continue;
+        t.push_back(x);
+    }
+    // ". . ." -> \cdots
+    std::vector<std::string> u;
+    for (size_t i = 0; i < t.size(); ++i) {
+        if (i + 2 < t.size() && t[i] == "." && t[i + 1] == "." && t[i + 2] == ".") {
+            u.push_back("\\cdots");
+            i += 2;
+        } else {
+            u.push_back(t[i]);
+        }
+    }
+    // "{ X }" -> "X" and "{ }" -> nothing, until stable
+    for (bool changed = true; changed;) {
+        changed = false;
+        std::vector<std::string> v;
+        for (size_t i = 0; i < u.size(); ++i) {
+            const bool keep_group = i > 0 && (u[i - 1] == "\\frac" || u[i - 1] == "\\sqrt" || (i > 1 && u[i - 2] == "\\frac"));
+            if (u[i] == "{" && i + 1 < u.size() && u[i + 1] == "}" && !keep_group) { ++i; changed = true; continue; }
+            if (u[i] == "{" && i + 2 < u.size() && u[i + 2] == "}" && u[i + 1] != "{" && u[i + 1] != "}") {
+                v.push_back(u[i + 1]);
+                i += 2;
+                changed = true;
+                continue;
+            }
+            v.push_back(u[i]);
+        }
+        u.swap(v);
+    }
+    return u;
+}
+
+inline bool latex_structural(const std::string& t) {
+    return t == "{" || t == "}" || t == "^" || t == "_" || t == "\\frac" || t == "\\sqrt" || t == "\\overline" ||
+           t == "\\underline" || t == "\\hat" || t == "\\bar" || t == "\\tilde" || t == "\\vec" || t == "\\dot" ||
+           t == "\\ddot" || t == "\\widetilde" || t == "\\widehat" || t == "&" || t == "\\\\";
+}
+
+struct LatexScore {
+    size_t n = 0, exact = 0, edits = 0, tokens = 0;
+    size_t sym_tp = 0, sym_pred = 0, sym_gt = 0;
+
+    void add(const std::string& gt, const std::string& pred) {
+        const auto g = latex_canonical(gt), p = latex_canonical(pred);
+        ++n;
+        tokens += g.size();
+        // token-level Levenshtein
+        std::vector<size_t> prev(p.size() + 1), cur(p.size() + 1);
+        for (size_t j = 0; j <= p.size(); ++j) prev[j] = j;
+        for (size_t i = 1; i <= g.size(); ++i) {
+            cur[0] = i;
+            for (size_t j = 1; j <= p.size(); ++j)
+                cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (g[i - 1] == p[j - 1] ? 0 : 1)});
+            std::swap(prev, cur);
+        }
+        edits += prev[p.size()];
+        exact += prev[p.size()] == 0;
+        std::map<std::string, int> bag;
+        for (const auto& x : g)
+            if (!latex_structural(x)) ++bag[x], ++sym_gt;
+        for (const auto& x : p)
+            if (!latex_structural(x)) {
+                ++sym_pred;
+                if (bag[x] > 0) --bag[x], ++sym_tp;
+            }
+    }
+    double ted() const { return tokens ? double(edits) / double(tokens) : 0; }
+    double em() const { return n ? double(exact) / double(n) : 0; }
+    double sym_p() const { return sym_pred ? double(sym_tp) / double(sym_pred) : 0; }
+    double sym_r() const { return sym_gt ? double(sym_tp) / double(sym_gt) : 0; }
+    double sym_f1() const { const double p = sym_p(), r = sym_r(); return p + r > 0 ? 2 * p * r / (p + r) : 0; }
+};
+
+}  // namespace dks::eval
 
 // === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\eval\metrics.hpp ===
 #pragma once
@@ -948,6 +1536,870 @@ inline InkResult extract_ink(GrayView g, const InkParams& IP = {}) {
 }
 
 }  // namespace dks
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\latex\latex_stage.hpp ===
+#pragma once
+// LatexStage: the LaTeX character + structure stage as a separable pipeline step.
+//
+// It is independent of the base text stage: it has its own atlas (math_fonts.dksa), its own
+// segmentation (no shared baseline) and its own parser. It considers a box only when
+//   * the box is a text candidate (layout Text) that the text stage did not verify as one-baseline
+//     text, or `claim_all_text` is set (pages known to be math); and
+//   * the math evidence passes (see MathEvidence / LatexStageParams): enough symbols, good template
+//     matches, few rare symbols, and — unless claim_all_text — genuine math content.
+// Claimed boxes get {"latex", "<tokens>"}; nothing else about the element changes.
+#include <memory>
+#include <numeric>
+#include <string>
+
+#include "../pipeline/pipeline_stage.hpp"
+#include "spatial_tree_parsing.hpp"
+
+namespace dks::latex {
+
+struct LatexStageParams {
+    bool claim_all_text = false;  // math-only pages: read every Text box as math
+    // Gating chosen on im2latex (positives) vs Zenodo desktops + stock wallpapers (negatives), see
+    // bench_latex_stage: ~27% of formula images claimed at <= 0.1 false claims per screen.
+    int min_symbols = 8;
+    float max_mean_dist = 20.f;   // mean template distance of the glyph symbols
+    float max_rare = 0.1f;        // share of symbols outside the common math vocabulary
+    int min_math_marks = 3;       // structure (^ _ \frac \sqrt) + math-only symbols (Greek, relations, big ops)
+    int max_height = 400;
+    // Formula regions: the layout splits a formula at scripts / fraction parts (its line rules want one
+    // baseline), so text boxes are grown by these fractions of their height and overlapping ones merged.
+    float grow_x = 0.8f, grow_y = 0.5f;
+    int max_region_members = 24;
+};
+
+// Evidence that a crop is a formula.
+struct MathEvidence {
+    int symbols = 0;
+    float mean_dist = 0;
+    float rare = 0;      // share of glyphs with a prior penalty (rare in math) or outside the vocabulary
+    int math_marks = 0;  // scripts / fractions / radicals + math-only symbols (Greek, operators, relations)
+    std::string tex;
+};
+
+inline MathEvidence math_evidence(const MathReader& reader, GrayView crop, const ParseParams& pp = {}) {
+    MathEvidence ev;
+    const auto syms = reader.symbols(crop);
+    ev.symbols = int(syms.size());
+    if (syms.empty()) return ev;
+    float d = 0;
+    int n = 0, rare = 0;
+    for (const auto& s : syms) {
+        if (s.kind == MathSymbol::Kind::Radical) ++ev.math_marks;
+        if (s.kind != MathSymbol::Kind::Glyph) continue;
+        d += s.dist, ++n;
+        if (MathReader::prior(s.ch) >= 5.f) ++rare;
+        const SymClass k = class_of(s.ch);
+        if ((s.ch >= 0x0391 && s.ch <= 0x03F5) || k == SymClass::BigOp || k == SymClass::Relation) ++ev.math_marks;
+    }
+    ev.mean_dist = n ? d / float(n) : 99.f;
+    ev.rare = n ? float(rare) / float(n) : 1.f;
+    ev.tex = parse_latex(syms, pp);
+    for (const char* m : {"^ {", "_ {", "\\frac", "\\sqrt"})
+        for (size_t p = ev.tex.find(m); p != std::string::npos; p = ev.tex.find(m, p + 1)) ++ev.math_marks;
+    return ev;
+}
+
+class LatexStage : public IPipelineStage {
+public:
+    LatexStage(std::shared_ptr<const ocr::Classifier> math_classifier, LatexStageParams p = {}, MathReadParams mp = {},
+               ParseParams pp = {}, MathPrior prior = {})
+        : cls_(std::move(math_classifier)), reader_(*cls_, mp, std::move(prior)), p_(p), pp_(pp) {}
+    const char* name() const override { return "latex"; }
+
+    // Candidate test on the text stage's reading of the box (if it ran).
+    bool candidate(const AnalysisContext& ctx, size_t i) const {
+        const Element& e = ctx.layout.elements[i];
+        if (e.kind != ElementKind::Text || e.bbox.h > p_.max_height) return false;
+        if (p_.claim_all_text || i >= ctx.reads.size()) return true;
+        const auto& r = ctx.reads[i];
+        return !(r.is_text && r.detail.line_fit && r.detail.fit_residual < 0.25f);  // one-baseline text: not ours
+    }
+
+    bool accept(const MathEvidence& ev) const {
+        if (p_.claim_all_text) return ev.symbols >= 2;  // caller asserts the content is math
+        if (ev.symbols < p_.min_symbols || ev.mean_dist > p_.max_mean_dist || ev.rare > p_.max_rare) return false;
+        return ev.math_marks >= p_.min_math_marks;
+    }
+
+    // Candidate formula regions: grown text boxes merged by overlap. A region is a candidate when at
+    // least one member is a candidate (not verified one-baseline text).
+    std::vector<Region> regions(const AnalysisContext& ctx) const {
+        const auto& E = ctx.layout.elements;
+        std::vector<uint32_t> ids;
+        std::vector<Rect> grown;
+        for (uint32_t i = 0; i < E.size(); ++i) {
+            if (E[i].kind != ElementKind::Text || E[i].bbox.h > p_.max_height) continue;
+            const Rect& b = E[i].bbox;
+            const int32_t gx = int32_t(p_.grow_x * float(b.h)), gy = int32_t(p_.grow_y * float(b.h));
+            ids.push_back(i);
+            grown.push_back(Rect{b.x - gx, b.y - gy, b.w + 2 * gx, b.h + 2 * gy});
+        }
+        if (ids.empty()) return {};
+        std::vector<uint32_t> par(ids.size());
+        std::iota(par.begin(), par.end(), 0u);
+        auto find = [&](uint32_t i) { while (par[i] != i) i = par[i] = par[par[i]]; return i; };
+        for (size_t a = 0; a < ids.size(); ++a)
+            for (size_t b = a + 1; b < ids.size(); ++b)
+                if (grown[a].inter_area(grown[b]) > 0) {
+                    const uint32_t x = find(uint32_t(a)), y = find(uint32_t(b));
+                    if (x != y) par[std::max(x, y)] = std::min(x, y);
+                }
+        std::vector<Region> out;
+        std::vector<int32_t> slot(ids.size(), -1);
+        for (size_t a = 0; a < ids.size(); ++a) {
+            const uint32_t r = find(uint32_t(a));
+            if (slot[r] < 0) slot[r] = int32_t(out.size()), out.emplace_back();
+            Region& g = out[size_t(slot[r])];
+            g.members.push_back(ids[a]);
+            g.box = g.box.unite(E[ids[a]].bbox);
+        }
+        std::vector<Region> keep;
+        for (auto& g : out) {
+            if (int(g.members.size()) > p_.max_region_members) continue;  // a whole text column, not a formula
+            bool any = false;
+            for (uint32_t m : g.members) any |= candidate(ctx, m);
+            if (!any) continue;
+            // include scripts / limits that sit just outside the member boxes
+            int32_t h = 0;
+            for (uint32_t m : g.members) h = std::max(h, E[m].bbox.h);
+            g.box = g.box.inflate(std::max<int32_t>(2, h * 3 / 10)).clip(ctx.frame.width, ctx.frame.height);
+            keep.push_back(std::move(g));
+        }
+        return keep;
+    }
+
+    void process(AnalysisContext& ctx) const override {
+        if (!ctx.has_layout) return;
+        const Gray8& luma = ctx.ensure_luma();
+        for (Region& g : regions(ctx)) {
+            const MathEvidence ev = math_evidence(reader_, luma.cview().sub(g.box), pp_);
+            if (!accept(ev)) continue;
+            const float score = std::clamp(1.f - ev.mean_dist / (2.f * p_.max_mean_dist), 0.f, 1.f);
+            g.tags.push_back(SemanticTag{"latex", ev.tex, score, name()});
+            for (uint32_t m : g.members) ctx.tag(m, "latex.region", std::to_string(ctx.regions.size()), score, name());
+            ctx.regions.push_back(std::move(g));
+        }
+    }
+
+    const MathReader& reader() const noexcept { return reader_; }
+    LatexStageParams& params() noexcept { return p_; }
+
+private:
+    std::shared_ptr<const ocr::Classifier> cls_;
+    MathReader reader_;
+    LatexStageParams p_;
+    ParseParams pp_;
+};
+
+}  // namespace dks::latex
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\latex\math_reader.hpp ===
+#pragma once
+// MathReader: symbol-level reading of a formula crop (Layer 2 of the LaTeX stage).
+//
+// Unlike the text recogniser there is no shared-baseline assumption: every symbol is found on its own
+// (connected components, with stacked parts merged: i j = ≤ ≥ ≡ : ; ! ÷), classified against the
+// math atlas, and given a *scale* (cap height implied by its best template) and a *baseline*. Two
+// structural symbols are found without templates:
+//   Bar      horizontal rule: minus / fraction bar / overline (decided by the parser from context)
+//   Radical  √ with its vinculum: a hook on the left plus a bar running over the radicand
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <cstdio>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "../ocr/ocr.hpp"
+#include "math_symbols.hpp"
+
+namespace dks::latex {
+
+struct MathSymbol {
+    enum class Kind : uint8_t { Glyph, Bar, Radical };
+    Kind kind = Kind::Glyph;
+    Rect box;
+    char32_t ch = 0;
+    std::string tex;
+    float dist = 0;              // template distance (Glyph)
+    float scale = 0;             // implied cap height in px (0 = unknown)
+    float baseline = 0;          // implied baseline y in px
+    int32_t radicand_x = 0;      // Radical: x where the vinculum starts
+    ocr::Candidate cand[4];
+    int ncand = 0;
+};
+
+struct MathReadParams {
+    InkParams ink;
+    int min_area = 2;
+    float bar_aspect = 3.f;      // w / h for a horizontal rule
+    float bar_fill = 0.7f;
+    float merge_overlap = 0.5f;  // x-overlap / narrower width for stacked parts
+    int topk = 4;
+    bool rescore = true;         // pass 2: re-rank candidates by prior + implied scale / baseline
+    float scale_weight = 14.f;   // distance units per |log| scale mismatch
+    float place_weight = 10.f;   // distance units per cap height of punctuation placement error
+    float prior_weight = 10.f;   // with a unigram prior loaded: max penalty for the rarest symbol
+};
+
+// Unigram symbol prior (label codepoint -> count), e.g. data/math_prior.tsv written by
+// `bench_latex --make-prior` from a *training / validation* split. Penalty = w * (1 - log(c+1)/log(max+1)).
+struct MathPrior {
+    std::unordered_map<char32_t, float> penalty;
+    float unseen = 1.f;
+    bool empty() const noexcept { return penalty.empty(); }
+
+    static MathPrior from_counts(const std::unordered_map<char32_t, double>& counts) {
+        MathPrior p;
+        double mx = 1;
+        for (const auto& [c, n] : counts) mx = std::max(mx, n);
+        const double lm = std::log(mx + 1);
+        for (const auto& [c, n] : counts) p.penalty[c] = float(1.0 - std::log(n + 1) / lm);
+        return p;
+    }
+    bool load(const std::string& path) {
+        std::ifstream in(path);
+        if (!in) return false;
+        std::unordered_map<char32_t, double> counts;
+        unsigned long cp;
+        double n;
+        while (in >> cp >> n) counts[char32_t(cp)] = n;
+        *this = from_counts(counts);
+        return !empty();
+    }
+    float operator()(char32_t c) const {
+        const auto it = penalty.find(c);
+        return it == penalty.end() ? unseen : it->second;
+    }
+};
+
+class MathReader {
+public:
+    MathReader(const ocr::Classifier& cls, MathReadParams p = {}, MathPrior prior = {})
+        : cls_(cls), p_(p), prior_(std::move(prior)) {}
+
+    std::vector<MathSymbol> symbols(GrayView crop) const {
+        std::vector<MathSymbol> out;
+        if (crop.width < 3 || crop.height < 3) return out;
+        const ocr::CropContext C = ocr::analyze_crop(crop, p_.ink);
+        const auto& comps = C.ccl.components;
+        std::vector<uint32_t> keep;
+        for (uint32_t i = 0; i < comps.size(); ++i)
+            if (comps[i].area >= p_.min_area) keep.push_back(i);
+        if (keep.empty()) return out;
+
+        std::vector<int32_t> hs;
+        for (uint32_t i : keep) hs.push_back(comps[i].bbox.h);
+        std::nth_element(hs.begin(), hs.begin() + ptrdiff_t(hs.size() / 2), hs.end());
+        const float Hmed = float(std::max(1, hs[hs.size() / 2]));
+
+        auto is_bar = [&](const Component& c) {
+            return float(c.bbox.w) >= p_.bar_aspect * float(c.bbox.h) && c.bbox.w >= 4 && c.fill() >= p_.bar_fill;
+        };
+        std::vector<int32_t> radical_start(comps.size(), -1);
+        for (uint32_t i : keep) {
+            const int32_t vx = radical_vinculum(C, comps[i]);
+            if (vx < 0) continue;
+            // A real radical covers a radicand: another component centred under the vinculum.
+            const Rect& rb = comps[i].bbox;
+            for (uint32_t j : keep)
+                if (j != i && comps[j].bbox.x + comps[j].bbox.w / 2 >= vx &&
+                    rb.contains_point(comps[j].bbox.x + comps[j].bbox.w / 2, comps[j].bbox.y + comps[j].bbox.h / 2)) {
+                    radical_start[i] = vx;
+                    break;
+                }
+        }
+
+        // Stacked-part merging (union-find over kept components).
+        std::vector<uint32_t> par(comps.size());
+        std::iota(par.begin(), par.end(), 0u);
+        auto find = [&](uint32_t i) { while (par[i] != i) i = par[i] = par[par[i]]; return i; };
+        for (size_t a = 0; a < keep.size(); ++a)
+            for (size_t b = a + 1; b < keep.size(); ++b) {
+                const Component &A = comps[keep[a]], &B = comps[keep[b]];
+                if (radical_start[keep[a]] >= 0 || radical_start[keep[b]] >= 0) continue;
+                const Rect &ra = A.bbox, &rb = B.bbox;
+                const int32_t xo = ra.x_overlap(rb), yo = ra.y_overlap(rb);
+                const int32_t wmin = std::min(ra.w, rb.w);
+                if (float(xo) < p_.merge_overlap * float(wmin)) continue;
+                const int32_t gap = -yo;  // vertical gap (<= 0 means overlap)
+                const bool bar_a = is_bar(A), bar_b = is_bar(B);
+                bool merge = false;
+                if (bar_a && bar_b) {  // = ≡ : similar-width rules close together
+                    merge = gap >= 0 && float(gap) <= 0.6f * Hmed && float(std::max(ra.w, rb.w)) <= 1.25f * float(wmin);
+                } else if (bar_a != bar_b) {  // ≤ ≥ ÷-bar: rule no wider than the glyph (a fraction bar is wider)
+                    const Rect& bar = bar_a ? ra : rb;
+                    const Rect& g = bar_a ? rb : ra;
+                    merge = gap >= 0 && float(gap) <= 0.35f * Hmed && float(bar.w) <= 1.15f * float(g.w) && float(g.h) <= 1.2f * Hmed;
+                } else {  // dots of i j ! ; : ? — one part tiny, or both tiny
+                    const int32_t amin = std::min(A.area, B.area), amax = std::max(A.area, B.area);
+                    const bool tiny_pair = float(std::max(ra.h, rb.h)) <= 0.4f * Hmed;
+                    merge = gap >= -1 && float(gap) <= 0.45f * Hmed && (float(amin) <= 0.3f * float(amax) || tiny_pair);
+                }
+                if (merge) {
+                    const uint32_t x = find(keep[a]), y = find(keep[b]);
+                    if (x != y) par[std::max(x, y)] = std::min(x, y);
+                }
+            }
+        std::vector<std::vector<uint32_t>> groups;
+        {
+            std::vector<int32_t> slot(comps.size(), -1);
+            for (uint32_t i : keep) {
+                const uint32_t r = find(i);
+                if (slot[r] < 0) slot[r] = int32_t(groups.size()), groups.emplace_back();
+                groups[size_t(slot[r])].push_back(i);
+            }
+        }
+
+        for (const auto& g : groups) {
+            MathSymbol s;
+            std::vector<ocr::Source> src;
+            for (uint32_t c : g) src.push_back({c, INT32_MIN, INT32_MAX}), s.box = s.box.unite(comps[c].bbox);
+            if (g.size() == 1 && radical_start[g[0]] >= 0) {
+                s.kind = MathSymbol::Kind::Radical;
+                s.ch = 0x221A;
+                s.tex = "\\sqrt";
+                s.radicand_x = radical_start[g[0]];
+                out.push_back(std::move(s));
+                continue;
+            }
+            if (g.size() == 1 && is_bar(comps[g[0]])) {
+                s.kind = MathSymbol::Kind::Bar;
+                s.ch = U'-';
+                s.tex = "-";
+                // Minus width is ~1.14 cap heights in Computer Modern; its centre sits on the math axis
+                // (~0.37 cap heights above the baseline).
+                s.scale = float(s.box.w) / 1.14f;
+                s.baseline = float(s.box.y) + 0.5f * float(s.box.h) + 0.37f * s.scale;
+                out.push_back(std::move(s));
+                continue;
+            }
+            const ocr::GlyphFeature f = ocr::sources_feature(C, src.data(), src.data() + src.size(), &s.box);
+            s.ncand = int(cls_.classify(f, s.cand, size_t(std::min(p_.topk, 4))));
+            if (s.ncand == 0) continue;
+            s.ch = s.cand[0].ch;
+            s.tex = tex_of(s.ch);
+            s.dist = s.cand[0].dist;
+            const ocr::Template& t = cls_.atlas().templates[s.cand[0].tmpl];
+            const float rel = std::max(0.15f, t.bot_rel - t.top_rel);
+            s.scale = float(s.box.h) / rel;
+            s.baseline = float(s.box.bottom()) - t.bot_rel * s.scale;
+            out.push_back(std::move(s));
+        }
+        if (p_.rescore) rescore(out);
+        std::sort(out.begin(), out.end(), [](const MathSymbol& a, const MathSymbol& b) {
+            return a.box.x != b.box.x ? a.box.x < b.box.x : a.box.y < b.box.y;
+        });
+        return out;
+    }
+
+    // Symbol frequency prior (distance units): letters, digits, common operators free; rare symbols pay.
+    static float prior(char32_t c) {
+        if ((c >= U'a' && c <= U'z') || (c >= U'A' && c <= U'Z') || (c >= U'0' && c <= U'9')) return 0.f;
+        switch (c) {
+            case U'(': case U')': case U'[': case U']': case U'+': case U'-': case U'=': case U',': case U'.':
+            case U'|': case U'/': case U'\'': return 0.f;
+            default: break;
+        }
+        if (c >= 0x03B1 && c <= 0x03C9) return 1.f;  // Greek
+        if (c >= 0x0393 && c <= 0x03A9) return 1.f;
+        switch (c) {
+            case 0x2211: case 0x220F: case 0x222B: case 0x2202: case 0x221E: case 0x00B1: case 0x00D7: case 0x2264:
+            case 0x2265: case 0x2192: case 0x2208: case 0x2261: case 0x2248: case 0x223C: case 0x22C5: case 0x2032:
+            case U'<': case U'>': case U'{': case U'}': case U';': case U':': case U'!': case U'*': return 2.f;
+            default: return 5.f;
+        }
+    }
+
+private:
+    static bool placement_punct(char32_t c) {
+        return c == U',' || c == U'.' || c == U'\'' || c == 0x22C5 || c == 0x00B7 || c == 0x2032 || c == U'`';
+    }
+
+    // Pass 2. With the main scale S and baseline B of the formula (median of the larger symbols):
+    //   * case twins / 1-l-I: the candidate whose implied scale fits S (on the baseline) or a script
+    //     level 0.71 S / 0.5 S (off the baseline) wins;
+    //   * punctuation (, . ' ·): placement against B decides;
+    //   * a frequency prior keeps rare symbols from winning on near-ties.
+    void rescore(std::vector<MathSymbol>& out) const {
+        std::vector<float> sc;
+        for (const auto& s : out)
+            if (s.kind == MathSymbol::Kind::Glyph && s.scale > 0) sc.push_back(s.scale);
+        if (sc.size() < 2) return;
+        std::sort(sc.begin(), sc.end(), std::greater<float>());
+        const float S = sc[(std::max<size_t>(1, (sc.size() * 6 + 9) / 10) - 1) / 2];  // median of the larger 60%
+        std::vector<float> bl;
+        for (const auto& s : out)
+            if (s.kind == MathSymbol::Kind::Glyph && s.scale >= 0.84f * S) bl.push_back(s.baseline);
+        if (bl.empty()) return;
+        std::sort(bl.begin(), bl.end());
+        const float B = bl[bl.size() / 2];
+        for (auto& s : out) {
+            if (s.kind != MathSymbol::Kind::Glyph || s.ncand == 0) continue;
+            float best = 1e30f;
+            int bi = 0;
+            for (int c = 0; c < s.ncand; ++c) {
+                const ocr::Template& t = cls_.atlas().templates[s.cand[c].tmpl];
+                const float rel = std::max(0.15f, t.bot_rel - t.top_rel);
+                const float sc_c = float(s.box.h) / rel;
+                const float bl_c = float(s.box.bottom()) - t.bot_rel * sc_c;
+                float pen;
+                if (placement_punct(s.cand[c].ch)) {
+                    // compare the symbol's top/bottom with where this punctuation sits on the main line
+                    pen = (std::fabs(float(s.box.y) - (B + t.top_rel * S)) + std::fabs(float(s.box.bottom()) - (B + t.bot_rel * S))) / S;
+                    pen *= p_.place_weight / p_.scale_weight;
+                } else if (std::fabs(bl_c - B) <= 0.15f * S) {
+                    pen = std::fabs(std::log(sc_c / S));
+                } else {
+                    pen = std::min(std::fabs(std::log(sc_c / (0.71f * S))), std::fabs(std::log(sc_c / (0.5f * S))));
+                }
+                const float pr = prior_.empty() ? prior(s.cand[c].ch) : p_.prior_weight * prior_(s.cand[c].ch);
+                const float score = s.cand[c].dist + pr + p_.scale_weight * pen;
+                if (score < best) best = score, bi = c;
+            }
+            if (bi != 0) {
+                const ocr::Template& t = cls_.atlas().templates[s.cand[bi].tmpl];
+                const float rel = std::max(0.15f, t.bot_rel - t.top_rel);
+                s.ch = s.cand[bi].ch;
+                s.tex = tex_of(s.ch);
+                s.dist = s.cand[bi].dist;
+                s.scale = float(s.box.h) / rel;
+                s.baseline = float(s.box.bottom()) - t.bot_rel * s.scale;
+            }
+        }
+    }
+
+public:
+
+private:
+    // A radical is one component: a hook on the left whose ink reaches the bottom quarter, and a
+    // horizontal vinculum in the top rows spanning most of the width. Returns the x where the
+    // vinculum starts (the radicand's left edge), or -1.
+    static int32_t radical_vinculum(const ocr::CropContext& C, const Component& c) {
+        const Rect& b = c.bbox;
+        if (b.h < 8 || b.w < b.h / 2 || c.fill() > 0.35f) return -1;
+        const int32_t band = std::max(1, b.h / 8);
+        int32_t best_len = 0, best_x0 = -1;
+        bool hook_low = false;
+        for (uint32_t i = c.run_begin; i < c.run_end; ++i) {
+            const Run& r = C.ccl.runs[i];
+            if (r.y < b.y + band && r.x1 - r.x0 > best_len) best_len = r.x1 - r.x0, best_x0 = r.x0;
+            if (r.y >= b.bottom() - b.h / 4 && r.x0 < b.x + b.w * 2 / 5) hook_low = true;
+        }
+        if (!hook_low || float(best_len) < 0.55f * float(b.w) || best_x0 <= b.x) return -1;
+        return best_x0;
+    }
+
+    const ocr::Classifier& cls_;
+    MathReadParams p_;
+    MathPrior prior_;
+};
+
+}  // namespace dks::latex
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\latex\math_symbols.hpp ===
+#pragma once
+// Math atlas labels -> LaTeX. Labels are the codepoints stored in data/math_fonts.dksa
+// (tools/build_math_atlas.py): ASCII letters/digits/punctuation, Greek, operators.
+#include <string>
+#include <unordered_map>
+
+#include "../core/utf8.hpp"
+
+namespace dks::latex {
+
+enum class SymClass : uint8_t { Ordinary, BigOp, Relation, Binary, Open, Close, Punct };
+
+struct SymbolInfo {
+    const char* tex;
+    SymClass cls;
+};
+
+inline const std::unordered_map<char32_t, SymbolInfo>& symbol_table() {
+    static const std::unordered_map<char32_t, SymbolInfo> t = [] {
+        std::unordered_map<char32_t, SymbolInfo> m;
+        const char* greek[] = {"\\alpha", "\\beta", "\\gamma", "\\delta", "\\varepsilon", "\\zeta", "\\eta", "\\theta",
+                               "\\iota", "\\kappa", "\\lambda", "\\mu", "\\nu", "\\xi", "o", "\\pi", "\\rho",
+                               "\\varsigma", "\\sigma", "\\tau", "\\upsilon", "\\varphi", "\\chi", "\\psi", "\\omega"};
+        for (int i = 0; i < 25; ++i) m[char32_t(0x03B1 + i)] = {greek[i], SymClass::Ordinary};
+        m[0x03F5] = {"\\epsilon", SymClass::Ordinary};
+        m[0x03D1] = {"\\vartheta", SymClass::Ordinary};
+        m[0x03D5] = {"\\phi", SymClass::Ordinary};
+        m[0x03F1] = {"\\varrho", SymClass::Ordinary};
+        m[0x03D6] = {"\\varpi", SymClass::Ordinary};
+        const std::pair<char32_t, const char*> upper[] = {{0x0393, "\\Gamma"}, {0x0394, "\\Delta"}, {0x0398, "\\Theta"},
+                                                          {0x039B, "\\Lambda"}, {0x039E, "\\Xi"}, {0x03A0, "\\Pi"},
+                                                          {0x03A3, "\\Sigma"}, {0x03A5, "\\Upsilon"}, {0x03A6, "\\Phi"},
+                                                          {0x03A8, "\\Psi"}, {0x03A9, "\\Omega"}};
+        for (auto& [c, s] : upper) m[c] = {s, SymClass::Ordinary};
+        const struct { char32_t c; const char* s; SymClass k; } ops[] = {
+            {U'+', "+", SymClass::Binary}, {U'-', "-", SymClass::Binary}, {U'=', "=", SymClass::Relation},
+            {U'<', "<", SymClass::Relation}, {U'>', ">", SymClass::Relation}, {U'(', "(", SymClass::Open},
+            {U')', ")", SymClass::Close}, {U'[', "[", SymClass::Open}, {U']', "]", SymClass::Close},
+            {U'{', "\\{", SymClass::Open}, {U'}', "\\}", SymClass::Close}, {U'|', "|", SymClass::Ordinary},
+            {U'/', "/", SymClass::Ordinary}, {U',', ",", SymClass::Punct}, {U'.', ".", SymClass::Punct},
+            {U';', ";", SymClass::Punct}, {U':', ":", SymClass::Relation}, {U'!', "!", SymClass::Ordinary},
+            {U'\'', "'", SymClass::Ordinary}, {U'*', "*", SymClass::Binary}, {U'&', "\\&", SymClass::Ordinary},
+            {U'#', "\\#", SymClass::Ordinary}, {U'"', "\"", SymClass::Ordinary}, {U'~', "\\sim", SymClass::Relation},
+            {0x00B1, "\\pm", SymClass::Binary}, {0x2213, "\\mp", SymClass::Binary}, {0x00D7, "\\times", SymClass::Binary},
+            {0x00F7, "\\div", SymClass::Binary}, {0x00B7, "\\cdot", SymClass::Binary}, {0x22C5, "\\cdot", SymClass::Binary},
+            {0x2217, "*", SymClass::Binary}, {0x2218, "\\circ", SymClass::Binary}, {0x2022, "\\bullet", SymClass::Binary},
+            {0x22C6, "\\star", SymClass::Binary}, {0x2264, "\\leq", SymClass::Relation}, {0x2265, "\\geq", SymClass::Relation},
+            {0x2260, "\\neq", SymClass::Relation}, {0x2248, "\\approx", SymClass::Relation}, {0x2261, "\\equiv", SymClass::Relation},
+            {0x223C, "\\sim", SymClass::Relation}, {0x2243, "\\simeq", SymClass::Relation}, {0x2245, "\\cong", SymClass::Relation},
+            {0x221D, "\\propto", SymClass::Relation}, {0x226A, "\\ll", SymClass::Relation}, {0x226B, "\\gg", SymClass::Relation},
+            {0x221E, "\\infty", SymClass::Ordinary}, {0x2202, "\\partial", SymClass::Ordinary}, {0x2207, "\\nabla", SymClass::Ordinary},
+            {0x2211, "\\sum", SymClass::BigOp}, {0x220F, "\\prod", SymClass::BigOp}, {0x222B, "\\int", SymClass::BigOp},
+            {0x222E, "\\oint", SymClass::BigOp}, {0x221A, "\\sqrt", SymClass::Ordinary}, {0x2192, "\\rightarrow", SymClass::Relation},
+            {0x2190, "\\leftarrow", SymClass::Relation}, {0x2194, "\\leftrightarrow", SymClass::Relation},
+            {0x21D2, "\\Rightarrow", SymClass::Relation}, {0x21D4, "\\Leftrightarrow", SymClass::Relation},
+            {0x27F6, "\\longrightarrow", SymClass::Relation}, {0x21A6, "\\mapsto", SymClass::Relation},
+            {0x2191, "\\uparrow", SymClass::Relation}, {0x2193, "\\downarrow", SymClass::Relation}, {0x2208, "\\in", SymClass::Relation},
+            {0x2209, "\\notin", SymClass::Relation}, {0x2282, "\\subset", SymClass::Relation}, {0x2283, "\\supset", SymClass::Relation},
+            {0x2286, "\\subseteq", SymClass::Relation}, {0x2287, "\\supseteq", SymClass::Relation}, {0x222A, "\\cup", SymClass::Binary},
+            {0x2229, "\\cap", SymClass::Binary}, {0x2200, "\\forall", SymClass::Ordinary}, {0x2203, "\\exists", SymClass::Ordinary},
+            {0x00AC, "\\neg", SymClass::Ordinary}, {0x2227, "\\wedge", SymClass::Binary}, {0x2228, "\\vee", SymClass::Binary},
+            {0x2297, "\\otimes", SymClass::Binary}, {0x2295, "\\oplus", SymClass::Binary}, {0x2299, "\\odot", SymClass::Binary},
+            {0x2020, "\\dagger", SymClass::Ordinary}, {0x2021, "\\ddagger", SymClass::Ordinary}, {0x2016, "\\Vert", SymClass::Ordinary},
+            {0x27E8, "\\langle", SymClass::Open}, {0x27E9, "\\rangle", SymClass::Close}, {0x210F, "\\hbar", SymClass::Ordinary},
+            {0x2113, "\\ell", SymClass::Ordinary}, {0x2026, "\\ldots", SymClass::Ordinary}, {0x22EF, "\\cdots", SymClass::Ordinary},
+            {0x22EE, "\\vdots", SymClass::Ordinary}, {0x2032, "\\prime", SymClass::Ordinary}, {0x22A5, "\\perp", SymClass::Relation},
+            {0x2225, "\\parallel", SymClass::Relation}, {0x25B3, "\\triangle", SymClass::Ordinary}, {0x2111, "\\Im", SymClass::Ordinary},
+            {0x211C, "\\Re", SymClass::Ordinary}, {0x2118, "\\wp", SymClass::Ordinary}, {0x2135, "\\aleph", SymClass::Ordinary},
+            {0x266F, "\\sharp", SymClass::Ordinary}, {0x266D, "\\flat", SymClass::Ordinary}, {0x2294, "\\sqcup", SymClass::Binary},
+            {0x2293, "\\sqcap", SymClass::Binary}, {0x22C4, "\\diamond", SymClass::Binary}, {0x21C0, "\\rightharpoonup", SymClass::Relation},
+        };
+        for (const auto& o : ops) m[o.c] = {o.s, o.k};
+        return m;
+    }();
+    return t;
+}
+
+inline std::string tex_of(char32_t c) {
+    const auto& t = symbol_table();
+    const auto it = t.find(c);
+    if (it != t.end()) return it->second.tex;
+    std::string s;
+    utf8_append(s, c);
+    return s;
+}
+
+inline SymClass class_of(char32_t c) {
+    const auto& t = symbol_table();
+    const auto it = t.find(c);
+    return it != t.end() ? it->second.cls : SymClass::Ordinary;
+}
+
+}  // namespace dks::latex
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\latex\spatial_tree_parsing.hpp ===
+#pragma once
+// Spatial Tree Parsing (deterministic operator dominance) — Layer 3 of the LaTeX stage.
+//
+// Once math symbols and their boxes are extracted (MathReader), the 2D layout is folded into a tree,
+// innermost structures first:
+//   1. Radicals   bounding-box containment: every symbol right of the radical's vinculum start and
+//                 inside its box is the radicand -> \sqrt { ... }
+//   1b. Accents   \bar \tilde \hat \vec \dot: a small mark directly over exactly one glyph
+//   2. Fractions  horizontal rules (w/h >= 3, fill >= 0.7), narrowest first: symbols whose x-span lies
+//                 within the bar's x-span and sit directly above / below form numerator / denominator ->
+//                 \frac { num } { den }. Rule with content only above -> \overline; nothing -> minus.
+//   3. Limits     big operators (∑ ∏) take symbols stacked above / below within their x-span.
+//   4. Scripts    the remaining nodes are read left to right against the main line (median scale S and
+//                 baseline B of the full-size symbols). Each symbol's scale and baseline come from its best
+//                 template's metrics, so x-height letters, ascenders and descenders are comparable. A
+//                 smaller symbol whose baseline is raised is a superscript, lowered a subscript; runs of
+//                 script symbols are parsed recursively (nested scripts, fractions inside scripts).
+// Output uses im2latex-style spaced tokens: "x _ { 1 } ^ { 2 }", "\frac { a } { b }".
+#include <algorithm>
+#include <string>
+#include <vector>
+
+#include "math_reader.hpp"
+
+namespace dks::latex {
+
+struct ParseParams {
+    float script_scale = 0.84f;   // scale / main scale below this = script size
+    float sup_raise = 0.22f;      // baseline raised by > this * S  -> superscript
+    float sub_drop = 0.12f;       // baseline lowered by > this * S -> subscript
+    float stack_reach = 2.2f;     // numerator / denominator / limits within this * S of the bar / operator
+};
+
+namespace detail {
+
+struct Node {
+    Rect box;
+    std::string tex;
+    MathSymbol::Kind kind = MathSymbol::Kind::Glyph;
+    char32_t ch = 0;
+    float scale = 0, baseline = 0;
+    int32_t radicand_x = 0;
+    bool group = false;  // composite (fraction / radical / limits): always main line
+};
+
+inline float main_scale(const std::vector<Node>& v) {
+    std::vector<float> s;
+    for (const auto& n : v)
+        if (n.scale > 0 && n.kind == MathSymbol::Kind::Glyph) s.push_back(n.scale);
+    if (s.empty())
+        for (const auto& n : v)
+            if (n.scale > 0) s.push_back(n.scale);
+    if (s.empty()) return 0;
+    std::sort(s.begin(), s.end(), std::greater<float>());
+    const size_t k = std::max<size_t>(1, (s.size() * 6 + 9) / 10);  // median of the larger 60%
+    return s[(k - 1) / 2];
+}
+
+inline std::string parse_nodes(std::vector<Node> v, const ParseParams& P, int depth);
+
+inline std::string join(const std::vector<Node>& v, const ParseParams& P, int depth) {
+    return parse_nodes(v, P, depth + 1);
+}
+
+inline bool centre_within(const Rect& r, const Rect& span, int slack) {
+    const int32_t c = r.x + r.w / 2;
+    return c >= span.x - slack && c < span.right() + slack;
+}
+
+inline std::string parse_nodes(std::vector<Node> v, const ParseParams& P, int depth) {
+    if (v.empty() || depth > 12) return "";
+    // A sub-expression (script, numerator, denominator, radicand) that is one one-like stem is "1".
+    if (depth > 0 && v.size() == 1 && !v[0].group && v[0].kind == MathSymbol::Kind::Glyph &&
+        (v[0].ch == U'l' || v[0].ch == U'I' || v[0].ch == U'J' || v[0].ch == 0x131))
+        return "1";
+    float S = main_scale(v);
+    if (S <= 0) S = 10.f;
+
+    // 1. radicals, smallest first
+    for (;;) {
+        int best = -1;
+        for (int i = 0; i < int(v.size()); ++i)
+            if (!v[size_t(i)].group && v[size_t(i)].kind == MathSymbol::Kind::Radical &&
+                (best < 0 || v[size_t(i)].box.area() < v[size_t(best)].box.area()))
+                best = i;
+        if (best < 0) break;
+        const Node R = v[size_t(best)];
+        std::vector<Node> inside, rest;
+        for (int i = 0; i < int(v.size()); ++i) {
+            if (i == best) continue;
+            const Node& n = v[size_t(i)];
+            const int32_t cx = n.box.x + n.box.w / 2, cy = n.box.y + n.box.h / 2;
+            (cx >= R.radicand_x && R.box.contains_point(cx, cy) ? inside : rest).push_back(n);
+        }
+        Node g = R;
+        g.group = true;
+        g.tex = "\\sqrt { " + join(inside, P, depth) + " }";
+        for (const auto& n : inside) g.box = g.box.unite(n.box);
+        g.scale = S;
+        g.baseline = float(R.box.bottom()) - 0.1f * S;
+        rest.push_back(g);
+        v.swap(rest);
+    }
+
+    // 1b. accents: a short rule / tilde / hat / arrow / dot directly above exactly one glyph, with
+    //     nothing stacked above it (so a fraction bar over a one-glyph denominator is never taken)
+    for (;;) {
+        bool changed = false;
+        for (size_t a = 0; a < v.size() && !changed; ++a) {
+            const Node& acc = v[a];
+            if (acc.group) continue;
+            const char* cmd = nullptr;
+            if (acc.kind == MathSymbol::Kind::Bar) cmd = "\\bar";
+            else if (acc.ch == U'~' || acc.ch == 0x223C) cmd = "\\tilde";
+            else if (acc.ch == U'^' || acc.ch == 0x02C6 || acc.ch == 0x2227) cmd = "\\hat";
+            else if (acc.ch == 0x2192 || acc.ch == 0x21C0) cmd = "\\vec";
+            else if (acc.ch == 0x22C5 || acc.ch == 0x00B7 || acc.ch == U'.') cmd = "\\dot";
+            if (!cmd || float(acc.box.h) > 0.45f * S) continue;
+            int under = -1, count = 0;
+            for (size_t b = 0; b < v.size(); ++b) {
+                if (b == a) continue;
+                const Node& g = v[b];
+                if (g.kind != MathSymbol::Kind::Glyph || g.group) continue;
+                if (!centre_within(acc.box, g.box, 1) || g.box.y < acc.box.bottom() - 1) continue;
+                if (float(g.box.y - acc.box.bottom()) > 0.35f * S) continue;
+                if (float(acc.box.w) > 1.6f * float(g.box.w) + 2.f) continue;
+                under = int(b), ++count;
+            }
+            if (count != 1) continue;
+            bool above = false;
+            for (size_t b = 0; b < v.size() && !above; ++b)
+                above = b != a && centre_within(v[b].box, acc.box, 1) && v[b].box.bottom() <= acc.box.y + 1 &&
+                        float(acc.box.y - v[b].box.bottom()) <= P.stack_reach * S;
+            if (above) continue;
+            Node g = v[size_t(under)];
+            g.tex = std::string(cmd) + " { " + g.tex + " }";
+            g.box = g.box.unite(acc.box);
+            std::vector<Node> rest;
+            for (size_t b = 0; b < v.size(); ++b)
+                if (b != a && b != size_t(under)) rest.push_back(v[b]);
+            rest.push_back(g);
+            v.swap(rest);
+            changed = true;
+        }
+        if (!changed) break;
+    }
+
+    // 2. fraction bars, narrowest first (inner fractions become groups before the outer bar looks)
+    for (;;) {
+        int best = -1;
+        for (int i = 0; i < int(v.size()); ++i) {
+            const Node& n = v[size_t(i)];
+            if (n.group || n.kind != MathSymbol::Kind::Bar) continue;
+            // only bars that actually have something stacked over or under them
+            bool stacked = false;
+            for (const auto& o : v)
+                if (&o != &n && centre_within(o.box, n.box, 1) && o.box.w <= n.box.w + 2 &&
+                    (o.box.bottom() <= n.box.y + 1 || o.box.y >= n.box.bottom() - 1) &&
+                    std::min(std::abs(o.box.bottom() - n.box.y), std::abs(o.box.y - n.box.bottom())) <= int32_t(P.stack_reach * S))
+                    stacked = true;
+            if (stacked && (best < 0 || n.box.w < v[size_t(best)].box.w)) best = i;
+        }
+        if (best < 0) break;
+        const Node B = v[size_t(best)];
+        std::vector<Node> num, den, rest;
+        const int32_t reach = int32_t(P.stack_reach * S * 2.f);
+        for (int i = 0; i < int(v.size()); ++i) {
+            if (i == best) continue;
+            const Node& n = v[size_t(i)];
+            const bool in_span = n.box.x >= B.box.x - 2 && n.box.right() <= B.box.right() + 2;
+            if (in_span && n.box.bottom() <= B.box.y + 1 && B.box.y - n.box.bottom() <= reach) num.push_back(n);
+            else if (in_span && n.box.y >= B.box.bottom() - 1 && n.box.y - B.box.bottom() <= reach) den.push_back(n);
+            else rest.push_back(n);
+        }
+        Node g = B;
+        g.group = true;
+        if (!num.empty() && !den.empty()) g.tex = "\\frac { " + join(num, P, depth) + " } { " + join(den, P, depth) + " }";
+        else if (!num.empty()) g.tex = "\\overline { " + join(num, P, depth) + " }";
+        else g.tex = "\\underline { " + join(den, P, depth) + " }";
+        for (const auto& n : num) g.box = g.box.unite(n.box);
+        for (const auto& n : den) g.box = g.box.unite(n.box);
+        g.scale = S;
+        g.baseline = float(B.box.y) + 0.5f * float(B.box.h) + 0.37f * S;  // bar sits on the math axis
+        rest.push_back(g);
+        v.swap(rest);
+    }
+
+    // 3. big-operator limits
+    for (size_t i = 0; i < v.size(); ++i) {
+        Node& op = v[i];
+        if (op.group || (op.ch != 0x2211 && op.ch != 0x220F)) continue;
+        std::vector<Node> above, below, rest;
+        const int32_t reach = int32_t(P.stack_reach * S);
+        for (size_t j = 0; j < v.size(); ++j) {
+            if (j == i) continue;
+            const Node& n = v[j];
+            if (centre_within(n.box, op.box, 2) && n.box.bottom() <= op.box.y + 1 && op.box.y - n.box.bottom() <= reach) above.push_back(n);
+            else if (centre_within(n.box, op.box, 2) && n.box.y >= op.box.bottom() - 1 && n.box.y - op.box.bottom() <= reach) below.push_back(n);
+        }
+        if (above.empty() && below.empty()) continue;
+        Node g = op;
+        g.group = true;
+        g.tex = op.tex;
+        if (!below.empty()) g.tex += " _ { " + join(below, P, depth) + " }";
+        if (!above.empty()) g.tex += " ^ { " + join(above, P, depth) + " }";
+        for (const auto& n : above) g.box = g.box.unite(n.box);
+        for (const auto& n : below) g.box = g.box.unite(n.box);
+        for (size_t j = 0; j < v.size(); ++j) {
+            if (j == i) continue;
+            bool used = false;
+            for (const auto& n : above) used |= n.box == v[j].box;
+            for (const auto& n : below) used |= n.box == v[j].box;
+            if (!used) rest.push_back(v[j]);
+        }
+        rest.push_back(g);
+        v.swap(rest);
+        i = size_t(-1);  // restart: indices changed
+    }
+
+    // 4. main line + scripts
+    std::sort(v.begin(), v.end(), [](const Node& a, const Node& b) {
+        return a.box.x != b.box.x ? a.box.x < b.box.x : a.box.y < b.box.y;
+    });
+    S = main_scale(v);
+    if (S <= 0) S = 10.f;
+    std::vector<float> bl;
+    for (const auto& n : v)
+        if (n.group || n.scale >= P.script_scale * S) bl.push_back(n.baseline);
+    std::sort(bl.begin(), bl.end());
+    const float B = bl.empty() ? 0.f : bl[bl.size() / 2];
+
+    enum Role { Main, Sup, Sub };
+    auto role = [&](const Node& n) {
+        if (n.group || n.scale <= 0 || n.scale >= P.script_scale * S) return Main;
+        if (n.ch == U'.' || n.ch == U',' || n.ch == U';') return Main;  // punctuation sits on the line
+        if (n.baseline < B - P.sup_raise * S) return Sup;
+        if (n.baseline > B + P.sub_drop * S) return Sub;
+        return Main;
+    };
+    // "1" context: at 4-5 px a Computer-Modern 1 and a slanted l / I / J are the same stem. A lone
+    // one-like glyph that is a whole script group, or that touches a digit on the main line, is "1".
+    auto one_like = [](const Node& n) {
+        return !n.group && n.kind == MathSymbol::Kind::Glyph && (n.ch == U'l' || n.ch == U'I' || n.ch == U'J' || n.ch == 0x131);
+    };
+    auto digit = [](const Node& n) { return !n.group && ((n.ch >= U'0' && n.ch <= U'9') || n.tex == "1"); };
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (!one_like(v[i]) || role(v[i]) != Main) continue;
+        for (size_t j : {i - 1, i + 1}) {
+            if (j >= v.size() || role(v[j]) != Main || !digit(v[j])) continue;
+            const int32_t gap = j < i ? v[i].box.x - v[j].box.right() : v[j].box.x - v[i].box.right();
+            if (float(gap) <= 0.35f * S) v[i].tex = "1";
+        }
+    }
+    auto script = [&](const std::vector<Node>& g) {
+        if (g.size() == 1 && one_like(g[0])) return std::string("1");
+        return join(g, P, depth);
+    };
+
+    std::string out;
+    auto emit = [&](const std::string& t) {
+        if (t.empty()) return;
+        if (!out.empty()) out += ' ';
+        out += t;
+    };
+    for (size_t i = 0; i < v.size();) {
+        if (role(v[i]) == Main) {
+            emit(v[i].tex);
+            ++i;
+        } else if (out.empty()) {
+            emit("{ }");  // pre-script with no base
+        }
+        std::vector<Node> sup, sub;
+        while (i < v.size() && role(v[i]) != Main) (role(v[i]) == Sup ? sup : sub).push_back(v[i]), ++i;
+        if (!sub.empty()) emit("_ { " + script(sub) + " }");
+        if (!sup.empty()) emit("^ { " + script(sup) + " }");
+    }
+    return out;
+}
+
+}  // namespace detail
+
+inline std::string parse_latex(const std::vector<MathSymbol>& syms, const ParseParams& P = {}) {
+    std::vector<detail::Node> v;
+    v.reserve(syms.size());
+    for (const auto& s : syms) {
+        detail::Node n;
+        n.box = s.box;
+        n.tex = s.tex;
+        n.kind = s.kind;
+        n.ch = s.ch;
+        n.scale = s.scale;
+        n.baseline = s.baseline;
+        n.radicand_x = s.radicand_x;
+        v.push_back(std::move(n));
+    }
+    return detail::parse_nodes(std::move(v), P, 0);
+}
+
+}  // namespace dks::latex
 
 // === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\ocr\atlas.hpp ===
 #pragma once
@@ -2130,6 +3582,235 @@ inline uint32_t sad256_abandon(const uint8_t* __restrict a, const uint8_t* __res
 
 }  // namespace dks::ocr
 
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\pipeline\core_stages.hpp ===
+#pragma once
+// The baseline behaviour as pipeline stages: cursor masking, layout (Layer 0) and the OCR pass over
+// every box with text verification (Layer 2). A pipeline of LayoutStage + TextReadStage produces
+// exactly what ScreenReader::read() produces.
+#include <functional>
+#include <memory>
+
+#include "pipeline_stage.hpp"
+
+namespace dks {
+
+// Removes a known overlay rectangle (typically the mouse cursor, see win32::cursor_rect) before
+// segmentation: each row inside the rect is replaced by a linear blend of the pixels just left and
+// right of it, so the pointer can no longer bridge glyph atoms. The rect is also recorded as an
+// exclusion for later stages.
+class CursorMaskStage : public IPipelineStage {
+public:
+    using RectProvider = std::function<bool(Rect&)>;
+    explicit CursorMaskStage(RectProvider provider) : provider_(std::move(provider)) {}
+    const char* name() const override { return "cursor_mask"; }
+
+    void process(AnalysisContext& ctx) const override {
+        Rect r;
+        if (!provider_ || !provider_(r)) return;
+        r = r.clip(ctx.frame.width, ctx.frame.height);
+        if (r.empty()) return;
+        ctx.exclusions.push_back(r);
+        uint8_t* px = ctx.writable_pixels();
+        const int bpp = bytes_per_pixel(ctx.frame.format);
+        const ptrdiff_t stride = ctx.frame.stride_bytes;
+        const int32_t xl = std::max(0, r.x - 1), xr = std::min(ctx.frame.width - 1, r.right());
+        for (int32_t y = r.y; y < r.bottom(); ++y) {
+            uint8_t* row = px + stride * y;
+            for (int32_t x = r.x; x < r.right(); ++x) {
+                const int32_t span = std::max(1, xr - xl);
+                const int32_t t = x - xl;
+                for (int c = 0; c < bpp; ++c)
+                    row[x * bpp + c] = uint8_t((int(row[xl * bpp + c]) * (span - t) + int(row[xr * bpp + c]) * t) / span);
+            }
+        }
+    }
+
+private:
+    RectProvider provider_;
+};
+
+class LayoutStage : public IPipelineStage {
+public:
+    explicit LayoutStage(LayoutParams p = {}) : p_(p) {}
+    const char* name() const override { return "layout"; }
+    void process(AnalysisContext& ctx) const override {
+        ctx.layout = analyze_layout(ctx.frame, p_);
+        ctx.has_layout = true;
+        ctx.tags.assign(ctx.layout.elements.size(), {});
+        for (size_t i = 0; i < ctx.layout.elements.size(); ++i)
+            ctx.tag(i, "kind", kind_name(ctx.layout.elements[i].kind), 1.f, name());
+    }
+
+private:
+    LayoutParams p_;
+};
+
+// OCR of every box + verification (the baseline ScreenReader behaviour). Tags verified boxes with
+// {"text", reading}.
+class TextReadStage : public IPipelineStage {
+public:
+    explicit TextReadStage(std::shared_ptr<const ScreenReader> reader) : reader_(std::move(reader)) {}
+    const char* name() const override { return "text"; }
+    void process(AnalysisContext& ctx) const override {
+        if (!ctx.has_layout) return;
+        ctx.reads = reader_->read_boxes(ctx.layout, ctx.ensure_luma());
+        for (size_t i = 0; i < ctx.reads.size(); ++i)
+            if (ctx.reads[i].is_text) ctx.tag(i, "text", ctx.reads[i].text, ctx.reads[i].confidence, name());
+    }
+
+private:
+    std::shared_ptr<const ScreenReader> reader_;
+};
+
+}  // namespace dks
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\pipeline\pipeline_stage.hpp ===
+#pragma once
+// Multi-pass pipeline blackboard.
+//
+//   Layer 0  core segmentation      LayoutStage              (edge map, run CCL, layout, hierarchy)
+//   Layer 1  detection packs        CursorMaskStage, DetectionStage (pluggable IShapeClassifier packs)
+//   Layer 2  recognisers            TextReadStage (ui_fonts.dksa), LatexStage (math_fonts.dksa)
+//   Layer 3  structural aggregators LaTeX spatial tree, ...
+//
+// Stages communicate only through AnalysisContext: the core layout and OCR types are never extended;
+// extra meaning is attached as SemanticTags per element. Stages can be added, removed, reordered or
+// switched off at runtime; the core engines are unchanged and still usable on their own.
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "../pipeline.hpp"
+
+namespace dks {
+
+// Open-ended per-element annotation, e.g. {"widget", "ui.checkbox"}, {"widget.state", "checked"},
+// {"latex", "\\frac { a } { b }"}, {"text", "Save"}.
+struct SemanticTag {
+    std::string key;
+    std::string value;
+    float score = 1.f;
+    std::string source;  // stage / pack that produced it
+};
+
+// A derived area produced by a stage (e.g. a formula spanning several layout elements).
+struct Region {
+    Rect box;
+    std::vector<uint32_t> members;  // layout element indices it was built from
+    std::vector<SemanticTag> tags;
+};
+
+struct StageTiming {
+    std::string stage;
+    double ms = 0;
+};
+
+struct AnalysisContext {
+    ColorView frame;                     // current pixels (points at `owned` after a stage rewrote them)
+    std::vector<uint8_t> owned;          // private BGRA/RGBA copy, made on first write
+    Gray8 luma;                          // see ensure_luma()
+    bool has_luma = false;
+    Layout layout;                       // Layer 0 output
+    bool has_layout = false;
+    std::vector<ReadElement> reads;      // Layer 2 OCR output (same order as layout.elements), may be empty
+    std::vector<std::vector<SemanticTag>> tags;  // tags[element index]
+    std::vector<Region> regions;         // derived areas (Layer 3 aggregators)
+    std::vector<Rect> exclusions;        // regions to ignore (cursor, overlays)
+    std::vector<StageTiming> timings;
+
+    explicit AnalysisContext(const ColorView& f) : frame(f) {}
+
+    // Copy-on-write access to the pixels (e.g. cursor inpainting); invalidates luma.
+    uint8_t* writable_pixels() {
+        if (owned.empty()) {
+            const size_t row_bytes = size_t(frame.width) * size_t(bytes_per_pixel(frame.format));
+            owned.resize(row_bytes * size_t(frame.height));
+            for (int32_t y = 0; y < frame.height; ++y) std::memcpy(owned.data() + row_bytes * size_t(y), frame.row(y), row_bytes);
+            frame = ColorView{owned.data(), frame.width, frame.height, ptrdiff_t(row_bytes), frame.format};
+        }
+        has_luma = false;
+        return owned.data();
+    }
+
+    const Gray8& ensure_luma() {
+        if (!has_luma) luma = to_luma(frame), has_luma = true;
+        return luma;
+    }
+
+    void tag(size_t element, std::string key, std::string value, float score, std::string source) {
+        if (tags.size() < layout.elements.size()) tags.resize(layout.elements.size());
+        tags[element].push_back(SemanticTag{std::move(key), std::move(value), score, std::move(source)});
+    }
+
+    const SemanticTag* find_tag(size_t element, const std::string& key) const {
+        if (element >= tags.size()) return nullptr;
+        const SemanticTag* best = nullptr;
+        for (const auto& t : tags[element])
+            if (t.key == key && (!best || t.score > best->score)) best = &t;
+        return best;
+    }
+};
+
+// Base pipeline step.
+class IPipelineStage {
+public:
+    virtual ~IPipelineStage() = default;
+    virtual const char* name() const = 0;
+    virtual void process(AnalysisContext& ctx) const = 0;
+};
+
+class Pipeline {
+public:
+    // Appends (or inserts before `before`) a stage. Stage names must be unique.
+    Pipeline& add(std::shared_ptr<IPipelineStage> stage, const std::string& before = "") {
+        remove(stage->name());
+        auto it = std::find_if(stages_.begin(), stages_.end(), [&](const Entry& e) { return e.stage->name() == before; });
+        stages_.insert(it, Entry{std::move(stage), true});
+        return *this;
+    }
+    bool remove(const std::string& name) {
+        const auto n = stages_.size();
+        stages_.erase(std::remove_if(stages_.begin(), stages_.end(), [&](const Entry& e) { return e.stage->name() == name; }),
+                      stages_.end());
+        return stages_.size() != n;
+    }
+    bool set_enabled(const std::string& name, bool on) {
+        for (auto& e : stages_)
+            if (e.stage->name() == name) return e.enabled = on, true;
+        return false;
+    }
+    std::vector<std::string> names() const {
+        std::vector<std::string> v;
+        for (const auto& e : stages_) v.push_back(std::string(e.stage->name()) + (e.enabled ? "" : " (off)"));
+        return v;
+    }
+
+    AnalysisContext run(const ColorView& frame) const {
+        AnalysisContext ctx(frame);
+        for (const auto& e : stages_) {
+            if (!e.enabled) continue;
+            const auto t0 = std::chrono::steady_clock::now();
+            e.stage->process(ctx);
+            ctx.timings.push_back({e.stage->name(),
+                                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()});
+        }
+        return ctx;
+    }
+
+private:
+    struct Entry {
+        std::shared_ptr<IPipelineStage> stage;
+        bool enabled;
+    };
+    std::vector<Entry> stages_;
+};
+
+}  // namespace dks
+
 // === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\include\dks\platform\win32.hpp ===
 #pragma once
 // Optional Windows platform layer (not included by dks.hpp):
@@ -2203,6 +3884,30 @@ inline Frame capture_screen() {
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
     return f;
+}
+
+// Current mouse cursor rectangle in capture_screen() coordinates (virtual-screen origin). GDI BitBlt
+// normally does not include the hardware cursor, but software cursors, pointer trails and remote
+// sessions do; CursorMaskStage uses this rect to inpaint it before segmentation.
+inline bool cursor_rect(Rect& out) {
+    CURSORINFO ci{};
+    ci.cbSize = sizeof(ci);
+    if (!GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING)) return false;
+    int32_t w = 32, h = 32, hx = 0, hy = 0;
+    ICONINFO ii{};
+    if (GetIconInfo(ci.hCursor, &ii)) {
+        hx = int32_t(ii.xHotspot), hy = int32_t(ii.yHotspot);
+        BITMAP bm{};
+        if (ii.hbmMask && GetObject(ii.hbmMask, sizeof(bm), &bm)) {
+            w = bm.bmWidth;
+            h = ii.hbmColor ? bm.bmHeight : bm.bmHeight / 2;  // monochrome cursors stack AND/XOR masks
+        }
+        if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    }
+    out = Rect{ci.ptScreenPos.x - hx - GetSystemMetrics(SM_XVIRTUALSCREEN), ci.ptScreenPos.y - hy - GetSystemMetrics(SM_YVIRTUALSCREEN),
+               w, h};
+    return true;
 }
 
 namespace detail {
