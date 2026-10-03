@@ -2,6 +2,7 @@
 // checksum so exact optimisations can be verified to change nothing.
 //
 //   bench_perf [--data datasets] [--threads 1] [--prune 3.0] [--no-memo] [--limit N] [--by-kind]
+//              [--sorted]   (the flat aspect-sorted scan instead of the default box tree; both exact)
 //
 // Each screenshot is read twice in a row: "cold" is the first read, "warm" the same frame again (a
 // live screen between changes). The memo cache persists across frames, as it would live.
@@ -26,7 +27,8 @@ int main(int argc, char** argv) {
     atlas.prune(prune);
     const double load_ms = tl.ms();
     bench::Timer tb;
-    ocr::Classifier cls(atlas, {}, ocr::SearchMode::Sorted, std::stof(bench::arg_value(argc, argv, "--margin", "15")));
+    const auto mode = bench::has_flag(argc, argv, "--sorted") ? ocr::SearchMode::Sorted : ocr::SearchMode::Boxes;
+    ocr::Classifier cls(atlas, {}, mode, std::stof(bench::arg_value(argc, argv, "--margin", "15")));
     const double build_ms = tb.ms();
     TextVerifyParams vp;
     vp.read_containers = vp.read_images = bench::has_flag(argc, argv, "--read-all");
@@ -36,8 +38,8 @@ int main(int argc, char** argv) {
     rp.atom_merge_px = std::stoi(bench::arg_value(argc, argv, "--atom-px", std::to_string(rp.atom_merge_px)));
     ScreenReader reader(cls, {}, rp, vp, threads);
     reader.enable_memo(memo);
-    std::printf("atlas %zu templates (load+prune %.0f ms, index %.0f ms), %u thread(s), memo %s\n", atlas.templates.size(), load_ms,
-                build_ms, reader.threads(), memo ? "on" : "off");
+    std::printf("atlas %zu templates (load+prune %.0f ms, index %.0f ms, %zu leaves), %u thread(s), memo %s\n", atlas.templates.size(), load_ms,
+                build_ms, cls.leaves(), reader.threads(), memo ? "on" : "off");
 
     std::vector<win32::Frame> frames;
     for (const auto& s : bench::load_manifest(root + "/zenodo")) {
@@ -53,7 +55,7 @@ int main(int argc, char** argv) {
     };
     struct Acc {
         double layout = 0, ocr = 0, search = 0;
-        uint64_t calls = 0, searches = 0, sads = 0, hits = 0;
+        uint64_t calls = 0, searches = 0, sads = 0, hits = 0, bounds = 0;
     } cold, warm;
     std::map<std::string, std::pair<double, uint64_t>> by_kind;  // kind -> (ms, classify calls), cold only
     size_t boxes = 0, verified = 0;
@@ -75,7 +77,7 @@ int main(int argc, char** argv) {
             a.layout += lay;
             const auto c1 = reader.counters();
             a.calls += c1.classify_calls - c0.classify_calls, a.searches += c1.search_calls - c0.search_calls;
-            a.sads += c1.distance_evals - c0.distance_evals, a.hits += c1.memo_hits - c0.memo_hits;
+            a.sads += c1.distance_evals - c0.distance_evals, a.bounds += c1.bound_evals - c0.bound_evals, a.hits += c1.memo_hits - c0.memo_hits;
             a.search += c1.search_ms - c0.search_ms;
             if (pass == 0) {
                 boxes += reads.size();
@@ -101,10 +103,11 @@ int main(int argc, char** argv) {
     for (int pass = 0; pass < 2; ++pass) {
         const Acc& a = pass ? warm : cold;
         std::printf("%s: layout %5.1f ms | OCR %6.1f ms/frame | classify %6.0f calls, %6.0f searched (memo %4.1f%%), "
-                    "search %6.1f ms, %5.1f us/search, %5.0f SAD/search\n",
+                    "search %6.1f ms, %5.1f us/search, %5.0f SAD/search, %6.0f bounds/search\n",
                     pass ? "warm" : "cold", a.layout / n, a.ocr / n, double(a.calls) / n, double(a.searches) / n,
                     100.0 * double(a.hits) / double(std::max<uint64_t>(1, a.calls)), a.search / n,
-                    1000.0 * a.search / double(std::max<uint64_t>(1, a.searches)), double(a.sads) / double(std::max<uint64_t>(1, a.searches)));
+                    1000.0 * a.search / double(std::max<uint64_t>(1, a.searches)), double(a.sads) / double(std::max<uint64_t>(1, a.searches)),
+                    double(a.bounds) / double(std::max<uint64_t>(1, a.searches)));
     }
     std::printf("%.0f boxes, %.0f verified text per frame\n", double(boxes) / n, double(verified) / n);
     std::printf("layout phases (ms/frame):");

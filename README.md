@@ -205,14 +205,15 @@ read again, which is what a live desktop looks like between changes. Single thre
 | | before | now | |
 |---|---:|---:|---|
 | layout, ms/frame | 22-26 | **15** | exact (same output) |
-| OCR cold, ms/frame | 720 | **~200-230** | accuracy equal or better on every benchmark |
+| OCR cold, ms/frame | 720 | **~117** | accuracy equal or better on every benchmark |
 | OCR warm, ms/frame | 49 | **0.3** | exact |
-| OCR cold, 8 threads | - | **~80** | thread count does not change the output |
+| OCR cold, 8 threads | - | **~43** | thread count does not change the output |
 
 What did it, in order of effect (each measured on speed *and* all accuracy benchmarks):
 
 | change | effect |
 |---|---|
+| box tree over the atlas (`SearchMode::Boxes`, default): k-means leaves of ~15 templates with min/max boxes in the 19-D space where the coarse bound is L1; only leaves under tau are scanned ([docs/PERFORMANCE.md](docs/PERFORMANCE.md)) | 59.6k -> 12.6k bounds and 1.3k -> 1.0k SADs per search; 166 -> 96 us/search, cold OCR 196 -> 117 ms; exact (same checksum) |
 | separate components merge into one glyph hypothesis only when they touch, or when faint ink (25-50% coverage) bridges a 1 px gap (broken arches of n / m / h) | 38% of hypotheses merged components across a clean gap and only 1.4% of those were ever chosen; classify calls -36%. WebUI CER 0.033 -> 0.017, ICDAR 0.397 -> 0.395 |
 | search margin 30 -> 15, top-6 -> top-4 candidates | full SADs per search halved; no accuracy change |
 | containers and images are not OCR'd by default (`read_containers` / `read_images`); their text is read as its own Text elements | -21% cold OCR; no metric change |
@@ -220,7 +221,9 @@ What did it, in order of effect (each measured on speed *and* all accuracy bench
 | box cache: a box crop's exact pixels -> its whole reading | warm OCR 15 -> 0.3 ms; exact |
 | one edge-strength pass shared by the strong and the weak (hysteresis) edge maps | layout 26 -> 15 ms; exact |
 
-Tried and rejected (exact, but slower): a per-(character, font) min/max box index (818 vs 250 us/search) and a
+Tried and rejected: PCA / Hamming projections, IVF and look-alike sets (all change the top-1 or top-4 on
+some queries), a streaming ink/splat pass (at most ~4 % of a cold frame); details in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md). Also exact but slower: a per-(character, font) min/max box index (818 vs 250 us/search) and a
 2x2-then-4x4 two-level bound (434 vs 233 us/search); the bound boxes are too loose to skip many of the 60k templates.
 Raising the atlas prune threshold barely shrinks the atlas (4.5 -> 56k templates, 6 -> 52k, 8 -> 46k with accuracy
 loss), because the templates come from distinct fonts and sizes rather than near-duplicates.

@@ -214,8 +214,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         atlas->prune(3.0f);
-        cls = std::make_unique<ocr::Classifier>(*atlas, ocr::FeatureWeights{}, ocr::SearchMode::Sorted,
-                                                std::stof(bench::arg_value(argc, argv, "--margin", "15")));
+        cls = std::make_unique<ocr::Classifier>(
+            *atlas, ocr::FeatureWeights{}, bench::has_flag(argc, argv, "--sorted") ? ocr::SearchMode::Sorted : ocr::SearchMode::Boxes,
+            std::stof(bench::arg_value(argc, argv, "--margin", "15")));
         cls->enable_memo(true);
         ocr::RecognizerParams rp;
         rp.topk = std::stoi(bench::arg_value(argc, argv, "--topk", std::to_string(rp.topk)));

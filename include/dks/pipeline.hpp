@@ -142,14 +142,14 @@ public:
     }
 
     struct Counters {
-        uint64_t classify_calls = 0, search_calls = 0, memo_hits = 0, distance_evals = 0;
+        uint64_t classify_calls = 0, search_calls = 0, memo_hits = 0, distance_evals = 0, bound_evals = 0;
         double search_ms = 0;
     };
     Counters counters() const {
         Counters c;
         for (const auto& k : cls_) {
             c.classify_calls += k.classify_calls, c.search_calls += k.search_calls, c.memo_hits += k.memo_hits;
-            c.distance_evals += k.distance_evals, c.search_ms += k.search_ms;
+            c.distance_evals += k.distance_evals, c.bound_evals += k.bound_evals, c.search_ms += k.search_ms;
         }
         return c;
     }

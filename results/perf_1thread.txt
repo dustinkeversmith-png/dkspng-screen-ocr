@@ -1,7 +1,7 @@
-atlas 59582 templates (load+prune 506 ms, index 12 ms), 1 thread(s), memo on
-cold: layout  14.4 ms | OCR  187.1 ms/frame | classify   1655 calls,   1118 searched (memo 32.4%), search  176.9 ms, 158.2 us/search,  1289 SAD/search
-warm: layout  14.4 ms | OCR    0.3 ms/frame | classify      0 calls,      0 searched (memo  0.0%), search    0.0 ms,   0.0 us/search,     0 SAD/search
+atlas 59582 templates (load+prune 503 ms, index 403 ms), 1 thread(s), memo on
+cold: layout  14.3 ms | OCR  117.2 ms/frame | classify   1655 calls,   1118 searched (memo 32.4%), search  107.5 ms,  96.2 us/search,   973 SAD/search,  12561 bounds/search
+warm: layout  14.3 ms | OCR    0.3 ms/frame | classify      0 calls,      0 searched (memo  0.0%), search    0.0 ms,   0.0 us/search,     0 SAD/search,      0 bounds/search
 213 boxes, 64 verified text per frame
-layout phases (ms/frame): atoms 0.0 | blocks 0.0 | ccl 0.7 | edge_mask 4.0 | flat_regions 4.2 | forest 0.1 | icons 0.2 | images 2.8 | line_end_icons 0.0 | lines 0.2 | luma 1.7 | punctuation 0.0 | words 0.4 |
+layout phases (ms/frame): atoms 0.0 | blocks 0.0 | ccl 0.7 | edge_mask 3.9 | flat_regions 4.1 | forest 0.1 | icons 0.2 | images 2.8 | line_end_icons 0.0 | lines 0.1 | luma 1.7 | punctuation 0.0 | words 0.4 |
 box cache hits: 10026
 reading checksum fba7702c4b8e62aa

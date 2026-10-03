@@ -1,18 +1,18 @@
-atlas: 45 fonts, 69660 raw -> 59582 templates after prune(3.0)  [load 439 ms, prune 113 ms]
-classifier: aspect-sorted (build 12 ms)
+atlas: 45 fonts, 69660 raw -> 59582 templates after prune(3.0)  [load 413 ms, prune 90 ms]
+classifier: box tree (build 405 ms)
 
 == synth/seen    n=600 (skipped 0)
    CER 0.060  | CER(case-insens.) 0.045  | EM 0.757  | EM(ci) 0.798
-   4.850 ms/crop, 600.8 us/glyph, 3344 full distance evals/glyph (190124 bound checks)
+   2.388 ms/crop, 295.8 us/glyph, 2512 full distance evals/glyph (37095 bound checks)
 
 == synth/unseen  n=600 (skipped 0)
    CER 0.102  | CER(case-insens.) 0.084  | EM 0.640  | EM(ci) 0.690
-   4.359 ms/crop, 548.2 us/glyph, 3257 full distance evals/glyph (177922 bound checks)
+   2.322 ms/crop, 292.1 us/glyph, 2489 full distance evals/glyph (36286 bound checks)
 
 == icdar_bd      n=4195 (skipped 30)
    CER 0.395  | CER(case-insens.) 0.377  | EM 0.390  | EM(ci) 0.409
-   3.305 ms/crop, 646.6 us/glyph, 4547 full distance evals/glyph (212262 bound checks)
+   1.980 ms/crop, 387.4 us/glyph, 3357 full distance evals/glyph (47645 bound checks)
 
 == webui         n=84 (skipped 9)
    CER 0.017  | CER(case-insens.) 0.013  | EM 0.821  | EM(ci) 0.845
-   4.061 ms/crop, 326.1 us/glyph, 1099 full distance evals/glyph (123037 bound checks)
+   1.735 ms/crop, 139.3 us/glyph, 854 full distance evals/glyph (18531 bound checks)

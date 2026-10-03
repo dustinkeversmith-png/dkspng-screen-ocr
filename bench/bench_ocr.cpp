@@ -43,10 +43,11 @@ int main(int argc, char** argv) {
     std::printf("atlas: %zu fonts, %zu raw -> %zu templates after prune(%.1f)  [load %.0f ms, prune %.0f ms]\n",
                 atlas.fonts.size(), atlas.raw_count, atlas.templates.size(), prune, load_ms, tp.ms());
 
-    const auto mode = bench::has_flag(argc, argv, "--vptree") ? ocr::SearchMode::VPTree : ocr::SearchMode::Sorted;
+    const auto mode = bench::has_flag(argc, argv, "--vptree") ? ocr::SearchMode::VPTree
+                      : bench::has_flag(argc, argv, "--sorted") ? ocr::SearchMode::Sorted : ocr::SearchMode::Boxes;
     bench::Timer tb;
     ocr::Classifier cls(atlas, {}, mode, std::stof(bench::arg_value(argc, argv, "--margin", "15")));
-    std::printf("classifier: %s (build %.0f ms)\n", mode == ocr::SearchMode::VPTree ? "vp-tree" : "aspect-sorted", tb.ms());
+    std::printf("classifier: %s (build %.0f ms)\n", mode == ocr::SearchMode::VPTree ? "vp-tree" : mode == ocr::SearchMode::Boxes ? "box tree" : "aspect-sorted", tb.ms());
     ocr::RecognizerParams P;
     P.char_penalty = std::stof(bench::arg_value(argc, argv, "--penalty", std::to_string(P.char_penalty)));
     P.metric_weight = std::stof(bench::arg_value(argc, argv, "--metric", std::to_string(P.metric_weight)));
