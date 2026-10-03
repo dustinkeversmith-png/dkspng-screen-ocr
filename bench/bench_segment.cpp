@@ -214,9 +214,14 @@ int main(int argc, char** argv) {
             return 1;
         }
         atlas->prune(3.0f);
-        cls = std::make_unique<ocr::Classifier>(*atlas);
+        cls = std::make_unique<ocr::Classifier>(*atlas, ocr::FeatureWeights{}, ocr::SearchMode::Sorted,
+                                                std::stof(bench::arg_value(argc, argv, "--margin", "15")));
         cls->enable_memo(true);
-        reader = std::make_unique<ScreenReader>(*cls, P);
+        ocr::RecognizerParams rp;
+        rp.topk = std::stoi(bench::arg_value(argc, argv, "--topk", std::to_string(rp.topk)));
+        rp.atom_merge_gap = std::stof(bench::arg_value(argc, argv, "--atom-gap", std::to_string(rp.atom_merge_gap)));
+    rp.atom_merge_px = std::stoi(bench::arg_value(argc, argv, "--atom-px", std::to_string(rp.atom_merge_px)));
+        reader = std::make_unique<ScreenReader>(*cls, P, rp);
         g_reader = reader.get();
         const std::string dump = bench::arg_value(argc, argv, "--ocr-dump", "");
         if (!dump.empty()) g_dump.open(dump, std::ios::binary);

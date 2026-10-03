@@ -45,12 +45,15 @@ int main(int argc, char** argv) {
 
     const auto mode = bench::has_flag(argc, argv, "--vptree") ? ocr::SearchMode::VPTree : ocr::SearchMode::Sorted;
     bench::Timer tb;
-    ocr::Classifier cls(atlas, {}, mode);
+    ocr::Classifier cls(atlas, {}, mode, std::stof(bench::arg_value(argc, argv, "--margin", "15")));
     std::printf("classifier: %s (build %.0f ms)\n", mode == ocr::SearchMode::VPTree ? "vp-tree" : "aspect-sorted", tb.ms());
     ocr::RecognizerParams P;
     P.char_penalty = std::stof(bench::arg_value(argc, argv, "--penalty", std::to_string(P.char_penalty)));
     P.metric_weight = std::stof(bench::arg_value(argc, argv, "--metric", std::to_string(P.metric_weight)));
     P.line_metrics = !bench::has_flag(argc, argv, "--no-metrics");
+    P.topk = std::stoi(bench::arg_value(argc, argv, "--topk", std::to_string(P.topk)));
+    P.atom_merge_gap = std::stof(bench::arg_value(argc, argv, "--atom-gap", std::to_string(P.atom_merge_gap)));
+    P.atom_merge_px = std::stoi(bench::arg_value(argc, argv, "--atom-px", std::to_string(P.atom_merge_px)));
     P.skip_cost = std::stof(bench::arg_value(argc, argv, "--skip", std::to_string(P.skip_cost)));
     P.space_gap = std::stof(bench::arg_value(argc, argv, "--space", std::to_string(P.space_gap)));
     P.harmonize = !bench::has_flag(argc, argv, "--no-harmonize");

@@ -27,9 +27,11 @@ add_test(NAME test_pipeline COMMAND test_pipeline WORKING_DIRECTORY ${CMAKE_CURR
 
 # Benchmarks / tools use the Win32 platform layer (WIC image IO, GDI capture).
 if(WIN32)
-  foreach(tool bench_segment bench_ocr ocr_debug screen_ocr bench_packs bench_latex screen_pipeline bench_latex_stage)
+  foreach(tool bench_segment bench_ocr ocr_debug screen_ocr bench_packs bench_latex screen_pipeline bench_latex_stage bench_perf train_pack)
     add_executable(${tool} bench/${tool}.cpp)
     target_include_directories(${tool} PRIVATE bench)
     target_link_libraries(${tool} PRIVATE dks gdi32 ole32 windowscodecs uuid user32)
   endforeach()
+  add_executable(pipeline_example examples/pipeline_example.cpp)
+  target_link_libraries(pipeline_example PRIVATE dks gdi32 ole32 windowscodecs uuid user32)
 endif()

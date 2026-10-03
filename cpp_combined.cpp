@@ -236,12 +236,15 @@ int main(int argc, char** argv) {
 
     const auto mode = bench::has_flag(argc, argv, "--vptree") ? ocr::SearchMode::VPTree : ocr::SearchMode::Sorted;
     bench::Timer tb;
-    ocr::Classifier cls(atlas, {}, mode);
+    ocr::Classifier cls(atlas, {}, mode, std::stof(bench::arg_value(argc, argv, "--margin", "15")));
     std::printf("classifier: %s (build %.0f ms)\n", mode == ocr::SearchMode::VPTree ? "vp-tree" : "aspect-sorted", tb.ms());
     ocr::RecognizerParams P;
     P.char_penalty = std::stof(bench::arg_value(argc, argv, "--penalty", std::to_string(P.char_penalty)));
     P.metric_weight = std::stof(bench::arg_value(argc, argv, "--metric", std::to_string(P.metric_weight)));
     P.line_metrics = !bench::has_flag(argc, argv, "--no-metrics");
+    P.topk = std::stoi(bench::arg_value(argc, argv, "--topk", std::to_string(P.topk)));
+    P.atom_merge_gap = std::stof(bench::arg_value(argc, argv, "--atom-gap", std::to_string(P.atom_merge_gap)));
+    P.atom_merge_px = std::stoi(bench::arg_value(argc, argv, "--atom-px", std::to_string(P.atom_merge_px)));
     P.skip_cost = std::stof(bench::arg_value(argc, argv, "--skip", std::to_string(P.skip_cost)));
     P.space_gap = std::stof(bench::arg_value(argc, argv, "--space", std::to_string(P.space_gap)));
     P.harmonize = !bench::has_flag(argc, argv, "--no-harmonize");
@@ -432,6 +435,126 @@ int main(int argc, char** argv) {
             pack->save(save + "/rico_widget_type.dkpk");
         }
     }
+    return 0;
+}
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\bench\bench_perf.cpp ===
+// Performance benchmark for the screen reading path (layout + OCR of every box), with an output
+// checksum so exact optimisations can be verified to change nothing.
+//
+//   bench_perf [--data datasets] [--threads 1] [--prune 3.0] [--no-memo] [--limit N] [--by-kind]
+//
+// Each screenshot is read twice in a row: "cold" is the first read, "warm" the same frame again (a
+// live screen between changes). The memo cache persists across frames, as it would live.
+#include <cstdio>
+#include <map>
+
+#include "common.hpp"
+#include "dks/pipeline.hpp"
+
+using namespace dks;
+
+int main(int argc, char** argv) {
+    const std::string root = bench::arg_value(argc, argv, "--data", "datasets");
+    const unsigned threads = unsigned(std::stoul(bench::arg_value(argc, argv, "--threads", "1")));
+    const float prune = std::stof(bench::arg_value(argc, argv, "--prune", "3.0"));
+    const size_t limit = size_t(std::stoul(bench::arg_value(argc, argv, "--limit", "1000")));
+    const bool memo = !bench::has_flag(argc, argv, "--no-memo");
+
+    bench::Timer tl;
+    ocr::Atlas atlas;
+    if (!atlas.load(bench::arg_value(argc, argv, "--atlas", "data/ui_fonts.dksa"))) return 1;
+    atlas.prune(prune);
+    const double load_ms = tl.ms();
+    bench::Timer tb;
+    ocr::Classifier cls(atlas, {}, ocr::SearchMode::Sorted, std::stof(bench::arg_value(argc, argv, "--margin", "15")));
+    const double build_ms = tb.ms();
+    TextVerifyParams vp;
+    vp.read_containers = vp.read_images = bench::has_flag(argc, argv, "--read-all");
+    ocr::RecognizerParams rp;
+    rp.topk = std::stoi(bench::arg_value(argc, argv, "--topk", std::to_string(rp.topk)));
+    rp.atom_merge_gap = std::stof(bench::arg_value(argc, argv, "--atom-gap", std::to_string(rp.atom_merge_gap)));
+    rp.atom_merge_px = std::stoi(bench::arg_value(argc, argv, "--atom-px", std::to_string(rp.atom_merge_px)));
+    ScreenReader reader(cls, {}, rp, vp, threads);
+    reader.enable_memo(memo);
+    std::printf("atlas %zu templates (load+prune %.0f ms, index %.0f ms), %u thread(s), memo %s\n", atlas.templates.size(), load_ms,
+                build_ms, reader.threads(), memo ? "on" : "off");
+
+    std::vector<win32::Frame> frames;
+    for (const auto& s : bench::load_manifest(root + "/zenodo")) {
+        if (frames.size() >= limit) break;
+        win32::Frame f = win32::load_image(s.image);
+        if (!f.empty()) frames.push_back(std::move(f));
+    }
+
+    uint64_t checksum = 1469598103934665603ull;
+    auto mix = [&](const std::string& s) {
+        for (unsigned char c : s) checksum = (checksum ^ c) * 1099511628211ull;
+        checksum = (checksum ^ 0xff) * 1099511628211ull;
+    };
+    struct Acc {
+        double layout = 0, ocr = 0, search = 0;
+        uint64_t calls = 0, searches = 0, sads = 0, hits = 0;
+    } cold, warm;
+    std::map<std::string, std::pair<double, uint64_t>> by_kind;  // kind -> (ms, classify calls), cold only
+    size_t boxes = 0, verified = 0;
+    std::map<std::string, double> phases;
+    LayoutParams lp;
+    lp.profile = true;
+    for (const auto& f : frames) {
+        bench::Timer t;
+        const Layout L = analyze_layout(f.view(), lp);
+        for (const auto& [k, v] : L.timings) phases[k] += v;
+        const double lay = t.ms();
+        const Gray8 gray = to_luma(f.view());
+        for (int pass = 0; pass < 2; ++pass) {
+            Acc& a = pass ? warm : cold;
+            const auto c0 = reader.counters();
+            bench::Timer t2;
+            const auto reads = reader.read_boxes(L, gray);
+            a.ocr += t2.ms();
+            a.layout += lay;
+            const auto c1 = reader.counters();
+            a.calls += c1.classify_calls - c0.classify_calls, a.searches += c1.search_calls - c0.search_calls;
+            a.sads += c1.distance_evals - c0.distance_evals, a.hits += c1.memo_hits - c0.memo_hits;
+            a.search += c1.search_ms - c0.search_ms;
+            if (pass == 0) {
+                boxes += reads.size();
+                for (const auto& r : reads) verified += r.is_text, mix(r.text), mix(r.is_text ? "1" : "0");
+            }
+        }
+        if (bench::has_flag(argc, argv, "--by-kind")) {  // separate cold run per kind, memo off
+            ScreenReader solo(cls, {}, rp, vp, threads);
+            solo.enable_memo(false);
+            for (ElementKind k : {ElementKind::Text, ElementKind::Icon, ElementKind::Container, ElementKind::Image}) {
+                Layout sub;
+                for (const auto& e : L.elements)
+                    if (e.kind == k) sub.elements.push_back(e);
+                const auto c0 = solo.counters();
+                bench::Timer t3;
+                solo.read_boxes(sub, gray);
+                by_kind[kind_name(k)].first += t3.ms();
+                by_kind[kind_name(k)].second += solo.counters().classify_calls - c0.classify_calls;
+            }
+        }
+    }
+    const double n = double(frames.size());
+    for (int pass = 0; pass < 2; ++pass) {
+        const Acc& a = pass ? warm : cold;
+        std::printf("%s: layout %5.1f ms | OCR %6.1f ms/frame | classify %6.0f calls, %6.0f searched (memo %4.1f%%), "
+                    "search %6.1f ms, %5.1f us/search, %5.0f SAD/search\n",
+                    pass ? "warm" : "cold", a.layout / n, a.ocr / n, double(a.calls) / n, double(a.searches) / n,
+                    100.0 * double(a.hits) / double(std::max<uint64_t>(1, a.calls)), a.search / n,
+                    1000.0 * a.search / double(std::max<uint64_t>(1, a.searches)), double(a.sads) / double(std::max<uint64_t>(1, a.searches)));
+    }
+    std::printf("%.0f boxes, %.0f verified text per frame\n", double(boxes) / n, double(verified) / n);
+    std::printf("layout phases (ms/frame):");
+    for (const auto& [k, v] : phases) std::printf(" %s %.1f |", k.c_str(), v / n);
+    std::printf("\n");
+    for (const auto& [k, v] : by_kind)
+        std::printf("  by kind (cold, memo off) %-10s %7.1f ms/frame %7.0f classify calls/frame\n", k.c_str(), v.first / n, double(v.second) / n);
+    std::printf("box cache hits: %llu\n", (unsigned long long)reader.box_hits());
+    std::printf("reading checksum %016llx\n", (unsigned long long)checksum);
     return 0;
 }
 
@@ -652,9 +775,14 @@ int main(int argc, char** argv) {
             return 1;
         }
         atlas->prune(3.0f);
-        cls = std::make_unique<ocr::Classifier>(*atlas);
+        cls = std::make_unique<ocr::Classifier>(*atlas, ocr::FeatureWeights{}, ocr::SearchMode::Sorted,
+                                                std::stof(bench::arg_value(argc, argv, "--margin", "15")));
         cls->enable_memo(true);
-        reader = std::make_unique<ScreenReader>(*cls, P);
+        ocr::RecognizerParams rp;
+        rp.topk = std::stoi(bench::arg_value(argc, argv, "--topk", std::to_string(rp.topk)));
+        rp.atom_merge_gap = std::stof(bench::arg_value(argc, argv, "--atom-gap", std::to_string(rp.atom_merge_gap)));
+    rp.atom_merge_px = std::stoi(bench::arg_value(argc, argv, "--atom-px", std::to_string(rp.atom_merge_px)));
+        reader = std::make_unique<ScreenReader>(*cls, P, rp);
         g_reader = reader.get();
         const std::string dump = bench::arg_value(argc, argv, "--ocr-dump", "");
         if (!dump.empty()) g_dump.open(dump, std::ios::binary);
@@ -944,6 +1072,217 @@ int main(int argc, char** argv) {
             o << '\n';
         }
     }
+    return 0;
+}
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\bench\train_pack.cpp ===
+// Compile a labelled crop dataset into a detection pack (.dkpk).
+//
+//   train_pack --classes DIR  --name NAME --tag-key KEY --out data/packs/NAME.dkpk [--k 3] [--holdout 5]
+//       DIR/<label>/*.png|jpg|bmp|gif|webp     one sub-folder per class, folder name = label
+//   train_pack --manifest DIR ...
+//       DIR/manifest.tsv + *.gt.tsv             the repo's dataset format; label = column 5 of the first row
+//
+// --holdout N   evaluate first: every N-th crop of each class (deterministic) is held out, accuracy and a
+//               confusion summary are printed, then the pack is trained on *all* crops and saved.
+// See docs/PACKS.md.
+#include <algorithm>
+#include <cstdio>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "common.hpp"
+#include "dks/detection/detection_pack.hpp"
+
+using namespace dks;
+
+namespace {
+
+struct Item {
+    std::string label, path;
+    Gray8 luma;
+};
+
+std::vector<std::string> list_dir(const std::string& dir, bool dirs) {
+    std::vector<std::string> out;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "/*").c_str(), &fd);
+    for (BOOL ok = h != INVALID_HANDLE_VALUE; ok; ok = FindNextFileA(h, &fd)) {
+        const std::string n = fd.cFileName;
+        if (n == "." || n == "..") continue;
+        const bool is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (is_dir == dirs) out.push_back(n);
+    }
+    if (h != INVALID_HANDLE_VALUE) FindClose(h);
+    std::sort(out.begin(), out.end());  // deterministic order
+    return out;
+}
+
+bool is_image(const std::string& n) {
+    std::string e = n.substr(n.find_last_of('.') + 1);
+    std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return e == "png" || e == "jpg" || e == "jpeg" || e == "bmp" || e == "gif" || e == "webp" || e == "tif" || e == "tiff";
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    const std::string classes = bench::arg_value(argc, argv, "--classes", "");
+    const std::string manifest = bench::arg_value(argc, argv, "--manifest", "");
+    const std::string name = bench::arg_value(argc, argv, "--name", "my_pack");
+    const std::string key = bench::arg_value(argc, argv, "--tag-key", "widget");
+    const std::string out = bench::arg_value(argc, argv, "--out", "data/packs/" + name + ".dkpk");
+    const int k = std::stoi(bench::arg_value(argc, argv, "--k", "3"));
+    const int holdout = std::stoi(bench::arg_value(argc, argv, "--holdout", "0"));
+    if (classes.empty() == manifest.empty()) {
+        std::fprintf(stderr, "usage: train_pack (--classes DIR | --manifest DIR) --name NAME --tag-key KEY [--out FILE] [--k 3] [--holdout 5]\n");
+        return 2;
+    }
+
+    std::vector<Item> items;
+    auto add = [&](const std::string& label, const std::string& path) {
+        win32::Frame f = win32::load_image(path);
+        if (f.empty()) { std::fprintf(stderr, "  ! cannot read %s\n", path.c_str()); return; }
+        items.push_back({label, path, to_luma(f.view())});
+    };
+    if (!classes.empty()) {
+        for (const auto& label : list_dir(classes, true))
+            for (const auto& file : list_dir(classes + "/" + label, false))
+                if (is_image(file)) add(label, classes + "/" + label + "/" + file);
+    } else {
+        for (const auto& s : bench::load_manifest(manifest)) {
+            const auto gt = bench::load_gt(s.gt);
+            if (!gt.empty()) add(gt[0].label, s.image);
+        }
+    }
+    std::map<std::string, int> per_class;
+    for (const auto& it : items) ++per_class[it.label];
+    std::printf("%zu crops, %zu classes\n", items.size(), per_class.size());
+    for (const auto& [l, c] : per_class) std::printf("  %-28s %5d%s\n", l.c_str(), c, c < 5 ? "   (few examples: expect low recall)" : "");
+    if (items.empty()) return 1;
+
+    if (holdout > 1) {
+        detect::TemplatePack eval(name, key, {}, k);
+        std::map<std::string, int> seen;
+        std::vector<const Item*> test;
+        for (const auto& it : items)
+            if (++seen[it.label] % holdout == 0) test.push_back(&it);
+            else eval.add_example(it.label, it.luma.cview());
+        std::map<std::string, std::map<std::string, int>> conf;
+        int ok = 0;
+        for (const Item* it : test) {
+            const auto m = eval.classify(detect::describe(it->luma.cview()));
+            const std::string pred = m.empty() ? "?" : m.front().tag;
+            ++conf[it->label][pred];
+            ok += pred == it->label;
+        }
+        std::printf("\nhold-out (every %d-th crop per class): accuracy %.3f (%d / %zu)\n", holdout,
+                    test.empty() ? 0.0 : double(ok) / double(test.size()), ok, test.size());
+        for (const auto& [gt, row] : conf) {
+            int tot = 0, hit = 0;
+            std::string worst;
+            int worst_n = 0;
+            for (const auto& [p, c] : row) {
+                tot += c, hit += p == gt ? c : 0;
+                if (p != gt && c > worst_n) worst = p, worst_n = c;
+            }
+            std::printf("  %-28s recall %.2f  (%d/%d)%s%s\n", gt.c_str(), double(hit) / double(tot), hit, tot,
+                        worst.empty() ? "" : "   most confused with ", worst.c_str());
+        }
+    }
+
+    detect::TemplatePack pack(name, key, {}, k);
+    for (const auto& it : items) pack.add_example(it.label, it.luma.cview());
+    if (!pack.save(out)) { std::fprintf(stderr, "cannot write %s\n", out.c_str()); return 1; }
+    std::printf("\nwrote %s  (%zu exemplars, %zu classes, k=%d, tag key '%s')\n", out.c_str(), pack.size(), pack.classes().size(), k,
+                key.c_str());
+    return 0;
+}
+
+// === C:\Users\Cutie Magic 500\projects\creative\screen-ocr\examples\pipeline_example.cpp ===
+// Building and inspecting the modular pipeline from C++ (see docs/PIPELINE.md).
+//
+//   build/pipeline_example                       live virtual desktop
+//   build/pipeline_example shot.png              a saved screenshot
+//   build/pipeline_example formula.png --math    treat text as math (LatexStage claim_all_text)
+#include <cstdio>
+#include <memory>
+#include <string>
+
+#include "dks/detection/detection_pack.hpp"
+#include "dks/detection/rule_packs.hpp"
+#include "dks/latex/latex_stage.hpp"
+#include "dks/pipeline/core_stages.hpp"
+#include "dks/platform/win32.hpp"
+
+int main(int argc, char** argv) {
+    SetProcessDPIAware();
+    const std::string image = argc > 1 && argv[1][0] != '-' ? argv[1] : "";
+    const bool math_page = argc > 2 && std::string(argv[2]) == "--math";
+
+    // ---- Layer 2 recognisers: each owns its atlas + classifier. The atlases must outlive the pipeline.
+    dks::ocr::Atlas ui_atlas, math_atlas;
+    if (!ui_atlas.load("data/ui_fonts.dksa") || !math_atlas.load("data/math_fonts.dksa")) {
+        std::fprintf(stderr, "run from the repo root (needs data/ui_fonts.dksa and data/math_fonts.dksa)\n");
+        return 1;
+    }
+    ui_atlas.prune(3.0f);
+    math_atlas.prune(3.0f);
+    const dks::ocr::Classifier ui_cls(ui_atlas);
+    auto reader = std::make_shared<dks::ScreenReader>(ui_cls);  // threads = all cores, output identical
+    reader->enable_memo(true);                                   // glyph memo + box cache (repeated frames)
+
+    // ---- Layer 1 packs: a widget-type pack, then a state pack that only runs on checkbox / radio boxes.
+    auto packs = std::make_shared<dks::detect::PackRegistry>();
+    if (auto type = dks::detect::TemplatePack::load("data/packs/rico_widget_type.dkpk")) packs->add(type);
+    dks::detect::PackScope on_checkboxes;
+    on_checkboxes.require_key = "widget";
+    on_checkboxes.require_any = {"ui.checkbox", "ui.radio"};
+    if (auto state = dks::detect::TemplatePack::load("data/packs/check_state.dkpk", on_checkboxes)) packs->add(state);
+    else packs->add(std::make_shared<dks::detect::CheckStatePack>(on_checkboxes));  // training-free fallback
+
+    // ---- LaTeX: separate stage, own atlas + prior.
+    auto math_cls = std::make_shared<dks::ocr::Classifier>(math_atlas);
+    dks::latex::MathPrior prior;
+    prior.load("data/math_prior.tsv");
+    dks::latex::LatexStageParams lp;
+    lp.claim_all_text = math_page;
+
+    // ---- Assemble. Order matters only through tags: DetectionStage after LayoutStage, LatexStage after
+    //      TextReadStage (it skips boxes the text stage read as one-baseline text).
+    dks::Pipeline pipe;
+    if (image.empty()) pipe.add(std::make_shared<dks::CursorMaskStage>([](dks::Rect& r) { return dks::win32::cursor_rect(r); }));
+    pipe.add(std::make_shared<dks::LayoutStage>())
+        .add(std::make_shared<dks::TextReadStage>(reader))
+        .add(std::make_shared<dks::detect::DetectionStage>(packs))
+        .add(std::make_shared<dks::latex::LatexStage>(math_cls, lp, dks::latex::MathReadParams{}, dks::latex::ParseParams{}, prior));
+
+    dks::win32::Frame frame = image.empty() ? dks::win32::capture_screen() : dks::win32::load_image(image);
+    if (frame.empty()) { std::fprintf(stderr, "no frame\n"); return 1; }
+    const dks::AnalysisContext ctx = pipe.run(frame.view());
+
+    // ---- Inspect.
+    std::printf("stages:");
+    for (const auto& t : ctx.timings) std::printf("  %s %.1f ms", t.stage.c_str(), t.ms);
+    std::printf("\n%zu layout elements, %zu exclusions (cursor)\n\n", ctx.layout.elements.size(), ctx.exclusions.size());
+
+    for (size_t i = 0; i < ctx.layout.elements.size(); ++i) {
+        const dks::Element& e = ctx.layout.elements[i];
+        const dks::SemanticTag* text = ctx.find_tag(i, "text");
+        const dks::SemanticTag* widget = ctx.find_tag(i, "widget");
+        const dks::SemanticTag* state = ctx.find_tag(i, "widget.state");
+        if (!text && !widget) continue;
+        std::printf("[%4d,%4d %4dx%3d] %-9s depth %d", e.bbox.x, e.bbox.y, e.bbox.w, e.bbox.h, dks::kind_name(e.kind), e.depth);
+        if (widget) std::printf("  widget=%s (%.2f)", widget->value.c_str(), widget->score);
+        if (state) std::printf("  widget.state=%s (%.2f)", state->value.c_str(), state->score);
+        if (text) std::printf("  text=\"%s\" (%.2f)", text->value.c_str(), text->score);
+        std::printf("\n");
+    }
+    for (const auto& r : ctx.regions)
+        for (const auto& t : r.tags)
+            std::printf("region [%d,%d %dx%d] %s=%s (%.2f, from %zu elements)\n", r.box.x, r.box.y, r.box.w, r.box.h, t.key.c_str(),
+                        t.value.c_str(), t.score, r.members.size());
     return 0;
 }
 

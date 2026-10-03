@@ -42,6 +42,12 @@ tools/       fetch_datasets.py       capped (<=50 MB/dataset) downloader + norma
              build_math_atlas.py     renders data/math_fonts.dksa from fonts/*.otf (Latin Modern Math, STIX Two Math)
 bench/       bench_segment  bench_ocr  screen_ocr (live)  ocr_debug
              bench_packs  bench_latex  bench_latex_stage  screen_pipeline (modular pipeline, live or image)
+             bench_perf (speed + output checksum)  train_pack (labelled crops -> .dkpk)
+examples/    pipeline_example.cpp    building and inspecting the pipeline from C++
+docs/        PIPELINE.md             running / debugging the pipeline (CLI and C++)
+             PACKS.md                making datasets and compiling them into packs
+tools/       generate_latex_html_report.py   MathJax report from `bench_latex --dump`
+             make_pack_dataset.py   crops from LabelMe JSON or a box list, one folder per class
 tests/       test_core.cpp  test_pipeline.cpp
 data/        ui_fonts.dksa  math_fonts.dksa  math_prior.tsv  packs/*.dkpk
 results/     outputs of the runs quoted below
@@ -155,10 +161,10 @@ scene-text (Ch.2) split. Text GT for real UI OCR comes from the WebUI sample's a
 
 | set | n | CER | CER (case-insens.) | exact match | EM (ci) |
 |---|---:|---:|---:|---:|---:|
-| synth/seen — atlas fonts, unseen sizes / colours | 600 | **0.059** | 0.045 | **0.763** | 0.807 |
-| synth/unseen — 10 held-out fonts never in the atlas | 600 | **0.103** | 0.085 | **0.653** | 0.707 |
-| ICDAR 2013 Born-Digital word crops | 4195 | **0.397** | 0.379 | **0.391** | 0.409 |
-| WebUI real browser text lines (lossy WebP) | 84 | **0.033** | 0.024 | **0.810** | 0.833 |
+| synth/seen — atlas fonts, unseen sizes / colours | 600 | **0.060** | 0.045 | **0.757** | 0.798 |
+| synth/unseen — 10 held-out fonts never in the atlas | 600 | **0.102** | 0.084 | **0.640** | 0.690 |
+| ICDAR 2013 Born-Digital word crops | 4195 | **0.395** | 0.377 | **0.390** | 0.409 |
+| WebUI real browser text lines (lossy WebP) | 84 | **0.017** | 0.013 | **0.821** | 0.845 |
 
 (synth/seen was regenerated with the 45-font atlas list, which added script and display faces, so it is
 not comparable with the earlier 0.056.) Ablation, shape-only nearest template: CER 0.125 / 0.278 / 0.676 / 0.231.
@@ -190,6 +196,34 @@ every box: 569 ms single-threaded cold → 138–160 ms cold → **23 ms** on re
 WebUI (323 pages): with verification, ink-tight Text P 0.308 / R 0.281. WebUI "StaticText" boxes are DOM
 element boxes (full-width `<h1>`s, whole `<p>`s, inline `<a>` fragments) and the GT omits most visible text,
 so Zenodo is the meaningful bounding benchmark.
+
+### Speed (`bench_perf`, `results/perf_*.txt`)
+
+Layout + OCR of every box on the 36 Zenodo 1920x1080 screenshots. "Cold" is a new screen; "warm" is the same screen
+read again, which is what a live desktop looks like between changes. Single thread unless noted.
+
+| | before | now | |
+|---|---:|---:|---|
+| layout, ms/frame | 22-26 | **15** | exact (same output) |
+| OCR cold, ms/frame | 720 | **~200-230** | accuracy equal or better on every benchmark |
+| OCR warm, ms/frame | 49 | **0.3** | exact |
+| OCR cold, 8 threads | - | **~80** | thread count does not change the output |
+
+What did it, in order of effect (each measured on speed *and* all accuracy benchmarks):
+
+| change | effect |
+|---|---|
+| separate components merge into one glyph hypothesis only when they touch, or when faint ink (25-50% coverage) bridges a 1 px gap (broken arches of n / m / h) | 38% of hypotheses merged components across a clean gap and only 1.4% of those were ever chosen; classify calls -36%. WebUI CER 0.033 -> 0.017, ICDAR 0.397 -> 0.395 |
+| search margin 30 -> 15, top-6 -> top-4 candidates | full SADs per search halved; no accuracy change |
+| containers and images are not OCR'd by default (`read_containers` / `read_images`); their text is read as its own Text elements | -21% cold OCR; no metric change |
+| bound pass: the running min moved to its own loop | that pass 55 -> 21 us (it now vectorises); exact |
+| box cache: a box crop's exact pixels -> its whole reading | warm OCR 15 -> 0.3 ms; exact |
+| one edge-strength pass shared by the strong and the weak (hysteresis) edge maps | layout 26 -> 15 ms; exact |
+
+Tried and rejected (exact, but slower): a per-(character, font) min/max box index (818 vs 250 us/search) and a
+2x2-then-4x4 two-level bound (434 vs 233 us/search); the bound boxes are too loose to skip many of the 60k templates.
+Raising the atlas prune threshold barely shrinks the atlas (4.5 -> 56k templates, 6 -> 52k, 8 -> 46k with accuracy
+loss), because the templates come from distinct fonts and sizes rather than near-duplicates.
 
 ### Detection packs (`bench_packs`, `results/packs.txt`)
 

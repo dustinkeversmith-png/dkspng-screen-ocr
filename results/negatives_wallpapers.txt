@@ -1,7 +1,15 @@
-== negatives [layout+OCR verify]  (28 images, 133.3 ms/frame avg, 2440 CCL atoms/frame)
-  Text                        0      4    0.000    0.000    0.000    0.000    0.000
+
+== negatives [layout+OCR verify]  (28 images, 96.2 ms/frame avg, 2440 CCL atoms/frame)
+  element bounding         n_gt n_pred    R@.50    P@.50    R@.75   F1@.50     mIoU
+  Text                        0      3    0.000    0.000    0.000    0.000    0.000
   Icon                        0    121    0.000    0.000    0.000    0.000    0.000
   Image                       0     61    0.000    0.000    0.000    0.000    0.000
   Container                   0     21    0.000    0.000    0.000    0.000    0.000
-  Text (as words)             0      4    0.000    0.000    0.000    0.000    0.000
-  Text (as blocks)            0      4    0.000    0.000    0.000    0.000    0.000
+  All                         0    206    0.000    0.000    0.000    0.000    0.000
+  Text (as words)             0      3    0.000    0.000    0.000    0.000    0.000
+  Text (as blocks)            0      3    0.000    0.000    0.000    0.000    0.000
+  text grouping               1:1    split    merge     miss  overlap
+  lines                     0.000    0.000    0.000    0.000    0.000
+  words                     0.000    0.000    0.000    0.000    0.000
+  blocks                    0.000    0.000    0.000    0.000    0.000
+  containment: matched 0, depth precision 0.000, parent precision 0.000

@@ -6,9 +6,11 @@
 //                       refinement of every template whose bound is under the admission threshold.
 //   SearchMode::VPTree  vantage-point tree over the full metric. Kept for comparison: in this 256-D
 //                       space it degenerates to ~15-25k distance evaluations per query (vs ~1.3k).
-//                       (A flat ball partition was also tried; it needed 7k-38k balls and was slower.)
+//                       (A flat ball partition and a per-(character, font) min/max box index were also
+//                       tried; both are exact but slower: the boxes are too loose to skip many templates.)
 // Both modes are exact and deterministic (ties broken by template index).
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -71,7 +73,7 @@ private:
 
 class Classifier {
 public:
-    Classifier(const Atlas& atlas, FeatureWeights w = {}, SearchMode mode = SearchMode::Sorted, float margin = 30.f)
+    Classifier(const Atlas& atlas, FeatureWeights w = {}, SearchMode mode = SearchMode::Sorted, float margin = 15.f)
         : atlas_(atlas), w_(w), mode_(mode), margin_(margin) {
         const size_t n = atlas.templates.size();
         idx_->by_aspect.resize(n);
@@ -108,10 +110,13 @@ public:
     const Atlas& atlas() const noexcept { return atlas_; }
     const FeatureWeights& weights() const noexcept { return w_; }
     mutable uint64_t distance_evals = 0, bound_evals = 0;
+    mutable uint64_t classify_calls = 0, search_calls = 0;  // calls / calls that missed the memo
+    mutable double search_ms = 0;                           // time spent in uncached searches
 
     // Fills up to k (<=16) best distinct characters, ascending distance. Returns count.
     size_t classify(const GlyphFeature& q, Candidate* out, size_t k) const {
         k = std::min<size_t>(k, 8);
+        ++classify_calls;
         uint64_t h = 0;
         if (memo_on_) {
             h = hash(q, k);
@@ -123,9 +128,12 @@ public:
                 return it->second.n;
             }
         }
+        ++search_calls;
+        const auto t0 = std::chrono::steady_clock::now();
         TopChars top(k, margin_);
         if (mode_ == SearchMode::VPTree) search_vp(0, q, top);
         else search_sorted(q, top);
+        search_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const size_t n = top.size();
         for (size_t i = 0; i < n; ++i) out[i] = top[i];
         if (memo_on_) {
@@ -164,12 +172,12 @@ private:
         const float* __restrict asp = idx_->aspects.data();
         const float* __restrict hol = idx_->holes_f.data();
         const float* __restrict ncp = idx_->ncomp_f.data();
-        float m = std::numeric_limits<float>::infinity();
-        for (size_t i = 0; i < n; ++i) {
+        for (size_t i = 0; i < n; ++i)
             bd[i] = float(lb[i]) * (1.f / 255.f) + wa * std::fabs(qa - asp[i]) + wh * std::fabs(qh - hol[i]) +
                     wc * std::fabs(qc - ncp[i]);
-            m = std::min(m, bd[i]);
-        }
+        // The min lives in its own loop: folded into the loop above it blocks vectorisation (55 -> 21 us).
+        float m = bd[0];
+        for (size_t i = 1; i < n; ++i) m = bd[i] < m ? bd[i] : m;
         bound_evals += n;
 
         // Pass A: refine the near-best band to establish tau. Pass B: everything else under tau.

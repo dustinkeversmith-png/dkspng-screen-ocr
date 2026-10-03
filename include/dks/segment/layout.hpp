@@ -3,6 +3,8 @@
 //   colour frame -> edge mask -> CCL atoms -> {glyph, container, icon, image} -> words -> lines
 //   -> containment forest over all elements.
 #include <algorithm>
+#include <chrono>
+#include <utility>
 #include <cmath>
 #include <cstdint>
 #include <numeric>
@@ -46,6 +48,7 @@ struct LayoutParams {
     float icon_max_ring_std = 12.f;   // max per-channel std-dev of a 3px ring around the box // ... when it is also this much taller than the rest of the line
     int icon_merge_gap = 3;    // px: pictogram fragments closer than this form one icon
     int min_area = 3;
+    bool profile = false;          // fill Layout::timings
     // Flat-region containers: 4-connected non-edge regions (panels, buttons, fields) that fill most
     // of their bounding box, with or without a drawn border.
     bool flat_containers = true;
@@ -84,6 +87,7 @@ struct Element {
 };
 
 struct Layout {
+    std::vector<std::pair<const char*, double>> timings;  // per phase, when LayoutParams::profile
     LabelResult ccl;
     std::vector<Element> elements;  // lines (Text), icons, images, containers
     std::vector<Element> words;     // finer Text granularity
@@ -92,6 +96,18 @@ struct Layout {
 };
 
 namespace detail {
+
+struct PhaseTimer {
+    std::vector<std::pair<const char*, double>>* out;
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    explicit PhaseTimer(std::vector<std::pair<const char*, double>>* o) : out(o) {}
+    void lap(const char* name) {
+        if (!out) return;
+        const auto now = std::chrono::steady_clock::now();
+        out->emplace_back(name, std::chrono::duration<double, std::milli>(now - t).count());
+        t = now;
+    }
+};
 
 inline float border_fraction(const LabelResult& L, const Component& c, int band) {
     const Rect& b = c.bbox;
@@ -206,11 +222,11 @@ inline bool vertical_gutter(const Gray8& edges, const Rect& a, const Rect& b, fl
 }
 
 // Hysteresis edge map: weak edges (> lo) kept only when 8-connected to a strong edge.
-inline Gray8 hysteresis_edges(const ColorView& f, const Gray8& strong, int lo) {
-    Gray8 weak(f.width, f.height);
-    edge_mask(f, weak.view(), lo);
+inline Gray8 hysteresis_edges(const Gray8& strength, const Gray8& strong, int lo) {
+    Gray8 weak(strength.width(), strength.height());
+    threshold_above(strength.cview(), weak.view(), lo);
     const LabelResult L = label_components(weak.cview(), Connectivity::Eight);
-    Gray8 out(f.width, f.height, 0);
+    Gray8 out(strength.width(), strength.height(), 0);
     for (uint32_t c = 0; c < L.components.size(); ++c) {
         const Component& k = L.components[c];
         bool has_strong = false;
@@ -348,13 +364,18 @@ inline std::vector<Rect> detect_flat_regions(const Gray8& edges, const Gray8& lu
 
 inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {}) {
     Layout out;
-    Gray8 mask(frame.width, frame.height);
-    edge_mask(frame, mask.view(), P.edge_threshold);
+    detail::PhaseTimer pt(P.profile ? &out.timings : nullptr);
+    Gray8 strength(frame.width, frame.height), mask(frame.width, frame.height);
+    edge_strength(frame, strength.view());
+    threshold_above(strength.cview(), mask.view(), P.edge_threshold);
+    pt.lap("edge_mask");
     out.ccl = label_components(mask.cview(), Connectivity::Eight);
     const auto& comps = out.ccl.components;
 
+    pt.lap("ccl");
     const Gray8 luma = to_luma(frame);
     std::vector<Rect> images;
+    pt.lap("luma");
     if (P.detect_images) images = detail::detect_images(frame, mask, P);
     auto inside_image = [&](const Rect& b) {
         for (const Rect& im : images)
@@ -381,6 +402,7 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
 
     std::vector<Rect> boxes(comps.size());
     std::vector<uint32_t> glyphs, small, pictos;
+    pt.lap("images");
     for (uint32_t i = 0; i < comps.size(); ++i) {
         const Component& c = comps[i];
         const Rect& b = c.bbox;
@@ -401,9 +423,10 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
         }
         if (b.h < P.glyph_min_h && b.w <= 3 * P.glyph_min_h) small.push_back(i);  // . , ' - etc.
     }
+    pt.lap("atoms");
     if (P.flat_containers)
         for (const Rect& b : detail::detect_flat_regions(
-                 P.weak_edge_threshold > 0 ? detail::hysteresis_edges(frame, mask, P.weak_edge_threshold) : mask, luma, P))
+                 P.weak_edge_threshold > 0 ? detail::hysteresis_edges(strength, mask, P.weak_edge_threshold) : mask, luma, P))
             if (!inside_image(b)) add_container(b, -1);
 
     // Words: tight gaps. Lines: words joined with wider gaps.
@@ -415,8 +438,10 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
     auto atom_veto = [&](uint32_t a, uint32_t b) {
         return P.luma_veto && std::abs(ink_of(a) - ink_of(b)) > P.luma_delta;
     };
+    pt.lap("flat_regions");
     auto words = detail::group_line_atoms(boxes, glyphs, P.word_gap, P, atom_veto);
 
+    pt.lap("words");
     // Absorb small punctuation atoms that sit inside a word's vertical band, just right of it.
     std::vector<Rect> wbox(words.size());
     for (size_t w = 0; w < words.size(); ++w)
@@ -436,6 +461,7 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
         }
     }
 
+    pt.lap("punctuation");
     // A word group whose first/last atom is taller than the rest *and* multi-coloured starts or ends
     // with a pictogram (e.g. folder icon + label): split it off.
     for (size_t w = 0; w < words.size(); ++w) {
@@ -481,6 +507,7 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
         out.words.push_back(std::move(e));
     }
 
+    pt.lap("line_end_icons");
     // Pictogram fragments -> icons (union of boxes within icon_merge_gap, capped at icon_max).
     {
         std::vector<uint32_t> par(pictos.size());
@@ -513,6 +540,7 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
     // Lines = words merged with a wider gap (same geometric rules on word boxes).
     std::vector<uint32_t> widx(text_word_boxes.size());
     std::iota(widx.begin(), widx.end(), 0u);
+    pt.lap("icons");
     std::vector<int> word_ink(text_word_boxes.size());
     for (size_t k = 0; k < text_word_boxes.size(); ++k) {
         std::vector<int> v;
@@ -539,6 +567,7 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
         out.elements.push_back(std::move(e));
     }
 
+    pt.lap("lines");
     // Paragraph blocks: stack lines whose vertical gap <= block_leading * height, similar heights, and
     // left-aligned or horizontally overlapping by most of the narrower line.
     {
@@ -579,11 +608,13 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
 
     std::vector<Rect> eb(out.elements.size());
     for (size_t i = 0; i < eb.size(); ++i) eb[i] = out.elements[i].bbox;
+    pt.lap("blocks");
     out.forest = build_containment_forest(eb);
     for (size_t i = 0; i < eb.size(); ++i) {
         out.elements[i].parent = out.forest.parent[i];
         out.elements[i].depth = out.forest.depth[i];
     }
+    pt.lap("forest");
     return out;
 }
 

@@ -136,6 +136,9 @@ inline bool has_flag(int argc, char** argv, const std::string& key) {
 // Output is identical for any thread count: each box is recognised independently and the memo
 // cache only affects speed.
 #include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <unordered_map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -152,6 +155,11 @@ struct TextVerifyParams {
     float max_mean_dist = 22.f;     // mean template distance of the chosen labels
     float max_fit_residual = 0.5f;  // mean baseline/cap-height placement error (cap heights)
     int max_height = 80;            // taller boxes are not read as a single line
+    // Which layout kinds get the OCR pass. Text inside a container is detected and read as its own
+    // Text element, so reading the container crop again repeats that work on a multi-line crop that
+    // verification almost always rejects. Icons stay on: a readable "icon" is promoted to text.
+    bool read_containers = false;
+    bool read_images = false;
 };
 
 struct ReadElement {
@@ -192,13 +200,18 @@ public:
         const unsigned n = threads ? threads : std::max(1u, std::thread::hardware_concurrency());
         cls_.reserve(n);
         for (unsigned i = 0; i < n; ++i) cls_.push_back(cls);
+        boxes_.resize(n);
     }
 
     LayoutParams& layout_params() noexcept { return lp_; }
     TextVerifyParams& verify_params() noexcept { return vp_; }
     unsigned threads() const noexcept { return unsigned(cls_.size()); }
-    void enable_memo(bool on) {
+    // Exact caches for repeated content: the glyph memo (per classifier) and the box cache, which maps a
+    // box crop's exact pixels to its whole reading, so an unchanged screen region is not re-read.
+    void enable_memo(bool on, size_t box_cache_entries = 4096) {
         for (auto& c : cls_) c.enable_memo(on);
+        box_cap_ = on ? box_cache_entries : 0;
+        for (auto& b : boxes_) b.clear();
     }
 
     ScreenRead read(const ColorView& frame) const {
@@ -220,8 +233,25 @@ public:
                 const Element& e = layout.elements[i];
                 re.element = e;
                 if (e.bbox.h > vp_.max_height) continue;
+                if ((e.kind == ElementKind::Container && !vp_.read_containers) || (e.kind == ElementKind::Image && !vp_.read_images))
+                    continue;
                 const Rect r = e.bbox.inflate(2).clip(gray.width(), gray.height());
-                re.detail = rec.recognize(gray.cview().sub(r));
+                const GrayView crop = gray.cview().sub(r);
+                if (box_cap_) {
+                    auto& cache = boxes_[t];
+                    const uint64_t h = crop_hash(crop);
+                    auto it = cache.find(h);
+                    if (it != cache.end() && it->second.same(crop)) {
+                        ++box_hits_;
+                        re.detail = it->second.rec;
+                    } else {
+                        re.detail = rec.recognize(crop);
+                        if (cache.size() >= box_cap_) cache.clear();
+                        cache[h] = BoxEntry::make(crop, re.detail);
+                    }
+                } else {
+                    re.detail = rec.recognize(crop);
+                }
                 re.text = re.detail.utf8();
                 re.confidence = text_confidence(re.detail, vp_);
                 re.is_text = vp_.enabled ? passes_verify(re.detail, vp_) : e.kind == ElementKind::Text;
@@ -237,6 +267,19 @@ public:
         return elements;
     }
 
+    struct Counters {
+        uint64_t classify_calls = 0, search_calls = 0, memo_hits = 0, distance_evals = 0;
+        double search_ms = 0;
+    };
+    Counters counters() const {
+        Counters c;
+        for (const auto& k : cls_) {
+            c.classify_calls += k.classify_calls, c.search_calls += k.search_calls, c.memo_hits += k.memo_hits;
+            c.distance_evals += k.distance_evals, c.search_ms += k.search_ms;
+        }
+        return c;
+    }
+
     // Aggregate classifier counters over all thread copies.
     uint64_t memo_hits() const {
         uint64_t s = 0;
@@ -244,8 +287,47 @@ public:
         return s;
     }
 
+    uint64_t box_hits() const noexcept { return box_hits_; }
+
 private:
+    struct BoxEntry {
+        int32_t w = 0, h = 0;
+        std::vector<uint8_t> pix;
+        ocr::Recognition rec;
+        static BoxEntry make(GrayView c, const ocr::Recognition& r) {
+            BoxEntry e;
+            e.w = c.width, e.h = c.height, e.rec = r;
+            e.pix.resize(size_t(c.width) * size_t(c.height));
+            for (int32_t y = 0; y < c.height; ++y) std::memcpy(&e.pix[size_t(y) * size_t(c.width)], c.row(y), size_t(c.width));
+            return e;
+        }
+        bool same(GrayView c) const {
+            if (c.width != w || c.height != h) return false;
+            for (int32_t y = 0; y < h; ++y)
+                if (std::memcmp(&pix[size_t(y) * size_t(w)], c.row(y), size_t(w)) != 0) return false;
+            return true;
+        }
+    };
+    static uint64_t crop_hash(GrayView c) {
+        uint64_t h = 0x9E3779B97F4A7C15ull ^ (uint64_t(c.width) << 32) ^ uint64_t(c.height);
+        for (int32_t y = 0; y < c.height; ++y) {
+            const uint8_t* p = c.row(y);
+            int32_t x = 0;
+            for (; x + 8 <= c.width; x += 8) {
+                uint64_t v;
+                std::memcpy(&v, p + x, 8);
+                h = (h ^ v) * 0x100000001B3ull;
+                h ^= h >> 29;
+            }
+            for (; x < c.width; ++x) h = (h ^ p[x]) * 0x100000001B3ull;
+        }
+        return h;
+    }
+
     mutable std::vector<ocr::Classifier> cls_;
+    mutable std::vector<std::unordered_map<uint64_t, BoxEntry>> boxes_;
+    size_t box_cap_ = 0;
+    mutable std::atomic<uint64_t> box_hits_{0};
     ocr::RecognizerParams rp_;
     LayoutParams lp_;
     TextVerifyParams vp_;
@@ -1269,30 +1351,61 @@ namespace dks {
 // than `threshold`. Flat UI regions vanish, glyph strokes / borders / icon detail survive, and both
 // dark-on-light and light-on-dark content produce the same map (no polarity decision needed).
 // The edge between p and p+1 is attributed to *both* pixels so 1px strokes stay 8-connected.
-inline void edge_mask(const ColorView& src, ImageView<uint8_t> dst, int threshold) noexcept {
+// Edge strength: for every pixel, the largest per-channel step to any 4-neighbour. `strength > t` is
+// exactly edge_mask(t), so several thresholds (strong / weak hysteresis) share one pass. Each step is
+// computed as a byte-wise absolute difference over whole rows, which vectorises.
+inline void edge_strength(const ColorView& src, ImageView<uint8_t> dst) {
     const int bpp = bytes_per_pixel(src.format);
-    const int32_t W = src.width, H = src.height;
-    for (int32_t y = 0; y < H; ++y) {
-        uint8_t* d = dst.row(y);
-        for (int32_t x = 0; x < W; ++x) d[x] = 0;
-    }
     const int nch = bpp >= 3 ? 3 : 1;
+    const int32_t W = src.width, H = src.height;
+    if (W <= 0 || H <= 0) return;
+    const size_t rb = size_t(W) * size_t(bpp);
+    std::vector<uint8_t> ad(rb), right(size_t(W) + 1, 0), down(size_t(W), 0), up(size_t(W), 0);
+    auto absdiff = [](const uint8_t* __restrict a, const uint8_t* __restrict b, uint8_t* __restrict o, size_t n) {
+        for (size_t i = 0; i < n; ++i) o[i] = a[i] > b[i] ? uint8_t(a[i] - b[i]) : uint8_t(b[i] - a[i]);
+    };
+    auto chmax = [&](uint8_t* __restrict o, int32_t count) {
+        for (int32_t x = 0; x < count; ++x) {
+            const uint8_t* p = &ad[size_t(x) * size_t(bpp)];
+            uint8_t m = p[0];
+            for (int c = 1; c < nch; ++c) m = p[c] > m ? p[c] : m;
+            o[x] = m;
+        }
+    };
     for (int32_t y = 0; y < H; ++y) {
         const uint8_t* s = src.row(y);
-        const uint8_t* sd = (y + 1 < H) ? src.row(y + 1) : nullptr;
-        uint8_t* d = dst.row(y);
-        uint8_t* dd = (y + 1 < H) ? dst.row(y + 1) : nullptr;
-        for (int32_t x = 0; x < W; ++x) {
-            const uint8_t* p = s + x * bpp;
-            int mr = 0, md = 0;
-            for (int c = 0; c < nch; ++c) {
-                if (x + 1 < W) { const int v = std::abs(int(p[c]) - int(p[bpp + c])); mr = v > mr ? v : mr; }
-                if (sd) { const int v = std::abs(int(p[c]) - int(sd[x * bpp + c])); md = v > md ? v : md; }
-            }
-            if (mr > threshold) { d[x] = 1; d[x + 1] = 1; }
-            if (md > threshold) { d[x] = 1; dd[x] = 1; }
+        // right[x + 1] = step between x and x + 1 (right[0] = 0 pads the left neighbour of x = 0)
+        absdiff(s, s + bpp, ad.data(), rb - size_t(bpp));
+        chmax(right.data() + 1, W - 1);
+        right[size_t(W)] = 0;
+        if (y + 1 < H) {
+            absdiff(s, src.row(y + 1), ad.data(), rb);
+            chmax(down.data(), W);
+        } else {
+            std::fill(down.begin(), down.end(), uint8_t(0));
         }
+        uint8_t* d = dst.row(y);
+        for (int32_t x = 0; x < W; ++x) {
+            uint8_t m = right[size_t(x)] > right[size_t(x) + 1] ? right[size_t(x)] : right[size_t(x) + 1];
+            m = down[size_t(x)] > m ? down[size_t(x)] : m;
+            d[x] = up[size_t(x)] > m ? up[size_t(x)] : m;
+        }
+        up.swap(down);
     }
+}
+
+inline void threshold_above(GrayView src, ImageView<uint8_t> dst, int t) noexcept {
+    for (int32_t y = 0; y < src.height; ++y) {
+        const uint8_t* s = src.row(y);
+        uint8_t* d = dst.row(y);
+        for (int32_t x = 0; x < src.width; ++x) d[x] = s[x] > t ? 1 : 0;
+    }
+}
+
+inline void edge_mask(const ColorView& src, ImageView<uint8_t> dst, int threshold) {
+    Gray8 e(src.width, src.height);
+    edge_strength(src, e.view());
+    threshold_above(e.cview(), dst, threshold);
 }
 
 // ----------------------------------------------------------------------------------------- otsu
@@ -2525,9 +2638,11 @@ private:
 //                       refinement of every template whose bound is under the admission threshold.
 //   SearchMode::VPTree  vantage-point tree over the full metric. Kept for comparison: in this 256-D
 //                       space it degenerates to ~15-25k distance evaluations per query (vs ~1.3k).
-//                       (A flat ball partition was also tried; it needed 7k-38k balls and was slower.)
+//                       (A flat ball partition and a per-(character, font) min/max box index were also
+//                       tried; both are exact but slower: the boxes are too loose to skip many templates.)
 // Both modes are exact and deterministic (ties broken by template index).
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -2590,7 +2705,7 @@ private:
 
 class Classifier {
 public:
-    Classifier(const Atlas& atlas, FeatureWeights w = {}, SearchMode mode = SearchMode::Sorted, float margin = 30.f)
+    Classifier(const Atlas& atlas, FeatureWeights w = {}, SearchMode mode = SearchMode::Sorted, float margin = 15.f)
         : atlas_(atlas), w_(w), mode_(mode), margin_(margin) {
         const size_t n = atlas.templates.size();
         idx_->by_aspect.resize(n);
@@ -2627,10 +2742,13 @@ public:
     const Atlas& atlas() const noexcept { return atlas_; }
     const FeatureWeights& weights() const noexcept { return w_; }
     mutable uint64_t distance_evals = 0, bound_evals = 0;
+    mutable uint64_t classify_calls = 0, search_calls = 0;  // calls / calls that missed the memo
+    mutable double search_ms = 0;                           // time spent in uncached searches
 
     // Fills up to k (<=16) best distinct characters, ascending distance. Returns count.
     size_t classify(const GlyphFeature& q, Candidate* out, size_t k) const {
         k = std::min<size_t>(k, 8);
+        ++classify_calls;
         uint64_t h = 0;
         if (memo_on_) {
             h = hash(q, k);
@@ -2642,9 +2760,12 @@ public:
                 return it->second.n;
             }
         }
+        ++search_calls;
+        const auto t0 = std::chrono::steady_clock::now();
         TopChars top(k, margin_);
         if (mode_ == SearchMode::VPTree) search_vp(0, q, top);
         else search_sorted(q, top);
+        search_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const size_t n = top.size();
         for (size_t i = 0; i < n; ++i) out[i] = top[i];
         if (memo_on_) {
@@ -2683,12 +2804,12 @@ private:
         const float* __restrict asp = idx_->aspects.data();
         const float* __restrict hol = idx_->holes_f.data();
         const float* __restrict ncp = idx_->ncomp_f.data();
-        float m = std::numeric_limits<float>::infinity();
-        for (size_t i = 0; i < n; ++i) {
+        for (size_t i = 0; i < n; ++i)
             bd[i] = float(lb[i]) * (1.f / 255.f) + wa * std::fabs(qa - asp[i]) + wh * std::fabs(qh - hol[i]) +
                     wc * std::fabs(qc - ncp[i]);
-            m = std::min(m, bd[i]);
-        }
+        // The min lives in its own loop: folded into the loop above it blocks vectorisation (55 -> 21 us).
+        float m = bd[0];
+        for (size_t i = 1; i < n; ++i) m = bd[i] < m ? bd[i] : m;
         bound_evals += n;
 
         // Pass A: refine the near-best band to establish tau. Pass B: everything else under tau.
@@ -3098,6 +3219,8 @@ struct RecognizerParams {
     float max_glyph_aspect = 1.9f;  // hypothesis width / text height
     float cut_min_aspect = 0.62f;   // atoms wider than this * H are considered for cutting
     float cut_profile = 0.55f;      // cut column ink <= this * atom max column ink (DP arbitrates)
+    float atom_merge_gap = 0.0f;    // pieces of *different* components: only touching / overlapping ...
+    int atom_merge_px = 1;          // ... or up to this many px apart when faint ink bridges the gap
     float merge_gap = 0.22f;        // pieces separated by more than this * H never form one glyph
     bool spaces = true;
     float space_gap = 0.38f;        // gap / cap height that becomes a space
@@ -3110,7 +3233,7 @@ struct RecognizerParams {
     bool width_norm = true;         // DP cost = distance * (glyph width / H) + char_penalty
     bool ascii_punct = false;       // fold typographic punctuation to ASCII (» -> >>, ’ -> ', – -> -)
     InkParams ink;                  // query-side binarisation options (templates always use defaults)
-    int topk = 6;
+    int topk = 4;
     int min_contrast = 28;
 };
 
@@ -3193,9 +3316,11 @@ public:
         if (atoms.empty()) return R;
 
         // --- pieces
-        struct Piece { std::vector<Source> src; Rect box; };
+        struct Piece { std::vector<Source> src; Rect box; uint32_t atom = 0; };
         std::vector<Piece> pieces;
+        uint32_t atom_id = 0;
         for (const auto& atom : atoms) {
+            ++atom_id;
             Rect ab;
             for (uint32_t c : atom) ab = ab.unite(comps[c].bbox);
             std::vector<int32_t> cuts;
@@ -3225,6 +3350,7 @@ public:
                 const int32_t xlo = prev == INT32_MIN ? INT32_MIN : ab.x + prev;
                 const int32_t xhi = cx == INT32_MAX ? INT32_MAX : ab.x + cx;
                 Piece pc;
+                pc.atom = atom_id;
                 for (uint32_t c : atom) pc.src.push_back({c, xlo, xhi});
                 pc.box = sources_bbox(C, pc.src.data(), pc.src.data() + pc.src.size());
                 if (!pc.box.empty()) pieces.push_back(std::move(pc));
@@ -3248,6 +3374,23 @@ public:
             Rect ub;
             for (size_t j = i; j < n && j < i + M; ++j) {
                 if (j > i && float(pieces[j].box.x - ub.right()) > p_.merge_gap * H) break;
+                if (j > i && pieces[j].atom != pieces[j - 1].atom) {
+                    const int32_t gpx = pieces[j].box.x - ub.right();
+                    const float gj = float(gpx) / H;
+                    // Separate components across a real gap are not one glyph. A gap of up to
+                    // atom_merge_px is still allowed at any size: faint arches of n / m / h / r break
+                    // a light glyph into components 1 px apart.
+                    if (gj > p_.atom_merge_gap) {
+                        if (gpx > p_.atom_merge_px) break;
+                        // Within atom_merge_px: only when faint ink (>= 25% coverage, below the 50% mask)
+                        // bridges the gap in the rows both sides share. Clean gaps are letter spacing.
+                        bool bridged = false;
+                        const int32_t y0 = std::max(ub.y, pieces[j].box.y), y1 = std::min(ub.bottom(), pieces[j].box.bottom());
+                        for (int32_t x = ub.right(); x < pieces[j].box.x && !bridged; ++x)
+                            for (int32_t y = y0; y < y1 && !bridged; ++y) bridged = C.ink.ink.at(x, y) >= 64;
+                        if (!bridged) break;
+                    }
+                }
                 ub = ub.unite(pieces[j].box);
                 src.insert(src.end(), pieces[j].src.begin(), pieces[j].src.end());
                 if (float(ub.w) > p_.max_glyph_aspect * H) break;
@@ -4206,6 +4349,8 @@ inline Forest build_containment_forest(const std::vector<Rect>& boxes, int32_t c
 //   colour frame -> edge mask -> CCL atoms -> {glyph, container, icon, image} -> words -> lines
 //   -> containment forest over all elements.
 #include <algorithm>
+#include <chrono>
+#include <utility>
 #include <cmath>
 #include <cstdint>
 #include <numeric>
@@ -4249,6 +4394,7 @@ struct LayoutParams {
     float icon_max_ring_std = 12.f;   // max per-channel std-dev of a 3px ring around the box // ... when it is also this much taller than the rest of the line
     int icon_merge_gap = 3;    // px: pictogram fragments closer than this form one icon
     int min_area = 3;
+    bool profile = false;          // fill Layout::timings
     // Flat-region containers: 4-connected non-edge regions (panels, buttons, fields) that fill most
     // of their bounding box, with or without a drawn border.
     bool flat_containers = true;
@@ -4287,6 +4433,7 @@ struct Element {
 };
 
 struct Layout {
+    std::vector<std::pair<const char*, double>> timings;  // per phase, when LayoutParams::profile
     LabelResult ccl;
     std::vector<Element> elements;  // lines (Text), icons, images, containers
     std::vector<Element> words;     // finer Text granularity
@@ -4295,6 +4442,18 @@ struct Layout {
 };
 
 namespace detail {
+
+struct PhaseTimer {
+    std::vector<std::pair<const char*, double>>* out;
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    explicit PhaseTimer(std::vector<std::pair<const char*, double>>* o) : out(o) {}
+    void lap(const char* name) {
+        if (!out) return;
+        const auto now = std::chrono::steady_clock::now();
+        out->emplace_back(name, std::chrono::duration<double, std::milli>(now - t).count());
+        t = now;
+    }
+};
 
 inline float border_fraction(const LabelResult& L, const Component& c, int band) {
     const Rect& b = c.bbox;
@@ -4409,11 +4568,11 @@ inline bool vertical_gutter(const Gray8& edges, const Rect& a, const Rect& b, fl
 }
 
 // Hysteresis edge map: weak edges (> lo) kept only when 8-connected to a strong edge.
-inline Gray8 hysteresis_edges(const ColorView& f, const Gray8& strong, int lo) {
-    Gray8 weak(f.width, f.height);
-    edge_mask(f, weak.view(), lo);
+inline Gray8 hysteresis_edges(const Gray8& strength, const Gray8& strong, int lo) {
+    Gray8 weak(strength.width(), strength.height());
+    threshold_above(strength.cview(), weak.view(), lo);
     const LabelResult L = label_components(weak.cview(), Connectivity::Eight);
-    Gray8 out(f.width, f.height, 0);
+    Gray8 out(strength.width(), strength.height(), 0);
     for (uint32_t c = 0; c < L.components.size(); ++c) {
         const Component& k = L.components[c];
         bool has_strong = false;
@@ -4551,13 +4710,18 @@ inline std::vector<Rect> detect_flat_regions(const Gray8& edges, const Gray8& lu
 
 inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {}) {
     Layout out;
-    Gray8 mask(frame.width, frame.height);
-    edge_mask(frame, mask.view(), P.edge_threshold);
+    detail::PhaseTimer pt(P.profile ? &out.timings : nullptr);
+    Gray8 strength(frame.width, frame.height), mask(frame.width, frame.height);
+    edge_strength(frame, strength.view());
+    threshold_above(strength.cview(), mask.view(), P.edge_threshold);
+    pt.lap("edge_mask");
     out.ccl = label_components(mask.cview(), Connectivity::Eight);
     const auto& comps = out.ccl.components;
 
+    pt.lap("ccl");
     const Gray8 luma = to_luma(frame);
     std::vector<Rect> images;
+    pt.lap("luma");
     if (P.detect_images) images = detail::detect_images(frame, mask, P);
     auto inside_image = [&](const Rect& b) {
         for (const Rect& im : images)
@@ -4584,6 +4748,7 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
 
     std::vector<Rect> boxes(comps.size());
     std::vector<uint32_t> glyphs, small, pictos;
+    pt.lap("images");
     for (uint32_t i = 0; i < comps.size(); ++i) {
         const Component& c = comps[i];
         const Rect& b = c.bbox;
@@ -4604,9 +4769,10 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
         }
         if (b.h < P.glyph_min_h && b.w <= 3 * P.glyph_min_h) small.push_back(i);  // . , ' - etc.
     }
+    pt.lap("atoms");
     if (P.flat_containers)
         for (const Rect& b : detail::detect_flat_regions(
-                 P.weak_edge_threshold > 0 ? detail::hysteresis_edges(frame, mask, P.weak_edge_threshold) : mask, luma, P))
+                 P.weak_edge_threshold > 0 ? detail::hysteresis_edges(strength, mask, P.weak_edge_threshold) : mask, luma, P))
             if (!inside_image(b)) add_container(b, -1);
 
     // Words: tight gaps. Lines: words joined with wider gaps.
@@ -4618,8 +4784,10 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
     auto atom_veto = [&](uint32_t a, uint32_t b) {
         return P.luma_veto && std::abs(ink_of(a) - ink_of(b)) > P.luma_delta;
     };
+    pt.lap("flat_regions");
     auto words = detail::group_line_atoms(boxes, glyphs, P.word_gap, P, atom_veto);
 
+    pt.lap("words");
     // Absorb small punctuation atoms that sit inside a word's vertical band, just right of it.
     std::vector<Rect> wbox(words.size());
     for (size_t w = 0; w < words.size(); ++w)
@@ -4639,6 +4807,7 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
         }
     }
 
+    pt.lap("punctuation");
     // A word group whose first/last atom is taller than the rest *and* multi-coloured starts or ends
     // with a pictogram (e.g. folder icon + label): split it off.
     for (size_t w = 0; w < words.size(); ++w) {
@@ -4684,6 +4853,7 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
         out.words.push_back(std::move(e));
     }
 
+    pt.lap("line_end_icons");
     // Pictogram fragments -> icons (union of boxes within icon_merge_gap, capped at icon_max).
     {
         std::vector<uint32_t> par(pictos.size());
@@ -4716,6 +4886,7 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
     // Lines = words merged with a wider gap (same geometric rules on word boxes).
     std::vector<uint32_t> widx(text_word_boxes.size());
     std::iota(widx.begin(), widx.end(), 0u);
+    pt.lap("icons");
     std::vector<int> word_ink(text_word_boxes.size());
     for (size_t k = 0; k < text_word_boxes.size(); ++k) {
         std::vector<int> v;
@@ -4742,6 +4913,7 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
         out.elements.push_back(std::move(e));
     }
 
+    pt.lap("lines");
     // Paragraph blocks: stack lines whose vertical gap <= block_leading * height, similar heights, and
     // left-aligned or horizontally overlapping by most of the narrower line.
     {
@@ -4782,11 +4954,13 @@ inline Layout analyze_layout(const ColorView& frame, const LayoutParams& P = {})
 
     std::vector<Rect> eb(out.elements.size());
     for (size_t i = 0; i < eb.size(); ++i) eb[i] = out.elements[i].bbox;
+    pt.lap("blocks");
     out.forest = build_containment_forest(eb);
     for (size_t i = 0; i < eb.size(); ++i) {
         out.elements[i].parent = out.forest.parent[i];
         out.elements[i].depth = out.forest.depth[i];
     }
+    pt.lap("forest");
     return out;
 }
 

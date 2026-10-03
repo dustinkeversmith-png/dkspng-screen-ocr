@@ -34,6 +34,8 @@ struct RecognizerParams {
     float max_glyph_aspect = 1.9f;  // hypothesis width / text height
     float cut_min_aspect = 0.62f;   // atoms wider than this * H are considered for cutting
     float cut_profile = 0.55f;      // cut column ink <= this * atom max column ink (DP arbitrates)
+    float atom_merge_gap = 0.0f;    // pieces of *different* components: only touching / overlapping ...
+    int atom_merge_px = 1;          // ... or up to this many px apart when faint ink bridges the gap
     float merge_gap = 0.22f;        // pieces separated by more than this * H never form one glyph
     bool spaces = true;
     float space_gap = 0.38f;        // gap / cap height that becomes a space
@@ -46,7 +48,7 @@ struct RecognizerParams {
     bool width_norm = true;         // DP cost = distance * (glyph width / H) + char_penalty
     bool ascii_punct = false;       // fold typographic punctuation to ASCII (» -> >>, ’ -> ', – -> -)
     InkParams ink;                  // query-side binarisation options (templates always use defaults)
-    int topk = 6;
+    int topk = 4;
     int min_contrast = 28;
 };
 
@@ -129,9 +131,11 @@ public:
         if (atoms.empty()) return R;
 
         // --- pieces
-        struct Piece { std::vector<Source> src; Rect box; };
+        struct Piece { std::vector<Source> src; Rect box; uint32_t atom = 0; };
         std::vector<Piece> pieces;
+        uint32_t atom_id = 0;
         for (const auto& atom : atoms) {
+            ++atom_id;
             Rect ab;
             for (uint32_t c : atom) ab = ab.unite(comps[c].bbox);
             std::vector<int32_t> cuts;
@@ -161,6 +165,7 @@ public:
                 const int32_t xlo = prev == INT32_MIN ? INT32_MIN : ab.x + prev;
                 const int32_t xhi = cx == INT32_MAX ? INT32_MAX : ab.x + cx;
                 Piece pc;
+                pc.atom = atom_id;
                 for (uint32_t c : atom) pc.src.push_back({c, xlo, xhi});
                 pc.box = sources_bbox(C, pc.src.data(), pc.src.data() + pc.src.size());
                 if (!pc.box.empty()) pieces.push_back(std::move(pc));
@@ -184,6 +189,23 @@ public:
             Rect ub;
             for (size_t j = i; j < n && j < i + M; ++j) {
                 if (j > i && float(pieces[j].box.x - ub.right()) > p_.merge_gap * H) break;
+                if (j > i && pieces[j].atom != pieces[j - 1].atom) {
+                    const int32_t gpx = pieces[j].box.x - ub.right();
+                    const float gj = float(gpx) / H;
+                    // Separate components across a real gap are not one glyph. A gap of up to
+                    // atom_merge_px is still allowed at any size: faint arches of n / m / h / r break
+                    // a light glyph into components 1 px apart.
+                    if (gj > p_.atom_merge_gap) {
+                        if (gpx > p_.atom_merge_px) break;
+                        // Within atom_merge_px: only when faint ink (>= 25% coverage, below the 50% mask)
+                        // bridges the gap in the rows both sides share. Clean gaps are letter spacing.
+                        bool bridged = false;
+                        const int32_t y0 = std::max(ub.y, pieces[j].box.y), y1 = std::min(ub.bottom(), pieces[j].box.bottom());
+                        for (int32_t x = ub.right(); x < pieces[j].box.x && !bridged; ++x)
+                            for (int32_t y = y0; y < y1 && !bridged; ++y) bridged = C.ink.ink.at(x, y) >= 64;
+                        if (!bridged) break;
+                    }
+                }
                 ub = ub.unite(pieces[j].box);
                 src.insert(src.end(), pieces[j].src.begin(), pieces[j].src.end());
                 if (float(ub.w) > p_.max_glyph_aspect * H) break;

@@ -17,30 +17,61 @@ namespace dks {
 // than `threshold`. Flat UI regions vanish, glyph strokes / borders / icon detail survive, and both
 // dark-on-light and light-on-dark content produce the same map (no polarity decision needed).
 // The edge between p and p+1 is attributed to *both* pixels so 1px strokes stay 8-connected.
-inline void edge_mask(const ColorView& src, ImageView<uint8_t> dst, int threshold) noexcept {
+// Edge strength: for every pixel, the largest per-channel step to any 4-neighbour. `strength > t` is
+// exactly edge_mask(t), so several thresholds (strong / weak hysteresis) share one pass. Each step is
+// computed as a byte-wise absolute difference over whole rows, which vectorises.
+inline void edge_strength(const ColorView& src, ImageView<uint8_t> dst) {
     const int bpp = bytes_per_pixel(src.format);
-    const int32_t W = src.width, H = src.height;
-    for (int32_t y = 0; y < H; ++y) {
-        uint8_t* d = dst.row(y);
-        for (int32_t x = 0; x < W; ++x) d[x] = 0;
-    }
     const int nch = bpp >= 3 ? 3 : 1;
+    const int32_t W = src.width, H = src.height;
+    if (W <= 0 || H <= 0) return;
+    const size_t rb = size_t(W) * size_t(bpp);
+    std::vector<uint8_t> ad(rb), right(size_t(W) + 1, 0), down(size_t(W), 0), up(size_t(W), 0);
+    auto absdiff = [](const uint8_t* __restrict a, const uint8_t* __restrict b, uint8_t* __restrict o, size_t n) {
+        for (size_t i = 0; i < n; ++i) o[i] = a[i] > b[i] ? uint8_t(a[i] - b[i]) : uint8_t(b[i] - a[i]);
+    };
+    auto chmax = [&](uint8_t* __restrict o, int32_t count) {
+        for (int32_t x = 0; x < count; ++x) {
+            const uint8_t* p = &ad[size_t(x) * size_t(bpp)];
+            uint8_t m = p[0];
+            for (int c = 1; c < nch; ++c) m = p[c] > m ? p[c] : m;
+            o[x] = m;
+        }
+    };
     for (int32_t y = 0; y < H; ++y) {
         const uint8_t* s = src.row(y);
-        const uint8_t* sd = (y + 1 < H) ? src.row(y + 1) : nullptr;
-        uint8_t* d = dst.row(y);
-        uint8_t* dd = (y + 1 < H) ? dst.row(y + 1) : nullptr;
-        for (int32_t x = 0; x < W; ++x) {
-            const uint8_t* p = s + x * bpp;
-            int mr = 0, md = 0;
-            for (int c = 0; c < nch; ++c) {
-                if (x + 1 < W) { const int v = std::abs(int(p[c]) - int(p[bpp + c])); mr = v > mr ? v : mr; }
-                if (sd) { const int v = std::abs(int(p[c]) - int(sd[x * bpp + c])); md = v > md ? v : md; }
-            }
-            if (mr > threshold) { d[x] = 1; d[x + 1] = 1; }
-            if (md > threshold) { d[x] = 1; dd[x] = 1; }
+        // right[x + 1] = step between x and x + 1 (right[0] = 0 pads the left neighbour of x = 0)
+        absdiff(s, s + bpp, ad.data(), rb - size_t(bpp));
+        chmax(right.data() + 1, W - 1);
+        right[size_t(W)] = 0;
+        if (y + 1 < H) {
+            absdiff(s, src.row(y + 1), ad.data(), rb);
+            chmax(down.data(), W);
+        } else {
+            std::fill(down.begin(), down.end(), uint8_t(0));
         }
+        uint8_t* d = dst.row(y);
+        for (int32_t x = 0; x < W; ++x) {
+            uint8_t m = right[size_t(x)] > right[size_t(x) + 1] ? right[size_t(x)] : right[size_t(x) + 1];
+            m = down[size_t(x)] > m ? down[size_t(x)] : m;
+            d[x] = up[size_t(x)] > m ? up[size_t(x)] : m;
+        }
+        up.swap(down);
     }
+}
+
+inline void threshold_above(GrayView src, ImageView<uint8_t> dst, int t) noexcept {
+    for (int32_t y = 0; y < src.height; ++y) {
+        const uint8_t* s = src.row(y);
+        uint8_t* d = dst.row(y);
+        for (int32_t x = 0; x < src.width; ++x) d[x] = s[x] > t ? 1 : 0;
+    }
+}
+
+inline void edge_mask(const ColorView& src, ImageView<uint8_t> dst, int threshold) {
+    Gray8 e(src.width, src.height);
+    edge_strength(src, e.view());
+    threshold_above(e.cview(), dst, threshold);
 }
 
 // ----------------------------------------------------------------------------------------- otsu

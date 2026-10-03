@@ -1,0 +1,7 @@
+atlas 59582 templates (load+prune 507 ms, index 12 ms), 8 thread(s), memo on
+cold: layout  14.5 ms | OCR   76.7 ms/frame | classify   2394 calls,   1890 searched (memo 21.1%), search  430.9 ms, 228.0 us/search,  1319 SAD/search
+warm: layout  14.5 ms | OCR    0.6 ms/frame | classify      0 calls,      0 searched (memo  0.0%), search    0.0 ms,   0.0 us/search,     0 SAD/search
+213 boxes, 64 verified text per frame
+layout phases (ms/frame): atoms 0.0 | blocks 0.0 | ccl 0.7 | edge_mask 4.0 | flat_regions 4.1 | forest 0.1 | icons 0.2 | images 2.8 | line_end_icons 0.0 | lines 0.2 | luma 1.7 | punctuation 0.0 | words 0.4 |
+box cache hits: 7800
+reading checksum fba7702c4b8e62aa
